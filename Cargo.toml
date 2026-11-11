@@ -1,0 +1,43 @@
+[package]
+name = "cu-overlay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Click-through Computer Use glow and drawn cursor for the claude-desktop-extra bridges (layer-shell overlay)"
+repository = "https://github.com/patrickjaja/cu-overlay"
+publish = false
+
+[features]
+default = ["layer-shell"]
+# Wayland backend: a wlr-layer-shell overlay surface (wlroots, KDE, Hyprland,
+# niri, river, COSMIC). Without it the crate is the renderer core and the
+# protocol only.
+layer-shell = [
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-wlr",
+]
+
+[dependencies]
+# Pure Rust, no C dependencies: builds static for the musl targets.
+libc = { version = "0.2.186", default-features = false, features = ["std"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+# layer-shell backend. wayland-client's default backend is the pure-Rust one
+# (no libwayland).
+wayland-client = { version = "0.31.14", optional = true }
+wayland-protocols = { version = "0.32.12", optional = true, features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.12", optional = true, features = ["client"] }
+
+[[bin]]
+name = "cu-overlay-demo"
+path = "src/bin/cu-overlay-demo.rs"
+required-features = ["layer-shell"]
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 8
+opt-level = 3
