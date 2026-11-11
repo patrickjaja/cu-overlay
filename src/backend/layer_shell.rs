@@ -151,7 +151,12 @@ struct Sub {
     key: Option<SubKey>,
     mult: Option<u32>,
     pos: Option<(i32, i32)>,
+    /// Buffer size (px) of the last content, reused to blank it in place.
+    dims: Option<(i32, i32)>,
 }
+
+/// The content key of a subsurface blanked in place (see `present_sub`).
+const BLANK: SubKey = SubKey([i32::MIN; 8]);
 
 impl Sub {
     fn destroy(self) {
@@ -508,13 +513,30 @@ impl LayerShell {
         });
         let sub = if ring { &mut surf.ring } else { &mut surf.cur };
         let Some((bx, k, paint)) = placed else {
-            if sub.key.is_some() {
-                sub.surf.attach(None, 0, 0);
-                sub.surf.commit();
-                sub.key = None;
-                return Ok(true);
+            // Hide by committing a fully transparent buffer of the same size
+            // in place, never by attaching null: on sway 1.9 / wlroots 0.17
+            // (ubuntu-24.04) an arrow unmapped that way stayed on screen
+            // while the scene kept animating, whereas buffer commits always
+            // repaint. The surface stays mapped, invisible and click-through,
+            // until the next draw.
+            let (Some(key), Some((bw, bh))) = (sub.key, sub.dims) else {
+                return Ok(false);
+            };
+            if key == BLANK {
+                return Ok(false);
             }
-            return Ok(false);
+            let id = st.take_buf(role, bw, bh, &self.qh)?;
+            let b = st.bufs.get_mut(&id).expect("buffer just taken");
+            render::clear(b.pixels());
+            b.busy = true;
+            let wl = b.wl.clone();
+            let surf = st.surf.as_mut().expect("surface checked above");
+            let sub = if ring { &mut surf.ring } else { &mut surf.cur };
+            sub.surf.attach(Some(&wl), 0, 0);
+            sub.surf.damage_buffer(0, 0, bw, bh);
+            sub.surf.commit();
+            sub.key = Some(BLANK);
+            return Ok(true);
         };
         let q = |v: f64| (v * 32.0).round() as i32;
         let baked = if has_alpha { 1.0 } else { opacity };
@@ -559,6 +581,7 @@ impl LayerShell {
                 None => sub.surf.set_buffer_scale((s120 / 120) as i32),
             }
             sub.key = Some(key);
+            sub.dims = Some((bw, bh));
             st.stats[if ring { 1 } else { 2 }] += 1;
             changed = true;
         }
@@ -775,6 +798,7 @@ impl Backend for LayerShell {
                 key: None,
                 mult: None,
                 pos: None,
+                dims: None,
             }
         };
         let main = g.compositor.create_surface(qh, ());

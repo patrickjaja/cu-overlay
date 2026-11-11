@@ -127,36 +127,42 @@ PY
 }
 # check <name> <output logical width> <python expressions over px(x,y) / region(...)>
 check() {
-  local name="$1" lw="$2" expr="$3"
-  python3 -I - "$EVID/$name.png" "$lw" "$expr" <<'PY'
-import sys
-from PIL import Image
-im = Image.open(sys.argv[1]).convert("RGB")
-k = im.width / float(sys.argv[2])          # image px per logical px
-def px(x, y):                               # logical -> pixel colour
-    return im.getpixel((min(im.width - 1, int(x * k)), min(im.height - 1, int(y * k))))
-def clay(p):   return p[0] > 150 and 70 < p[1] < 160 and p[2] < 130 and p[0] - p[2] > 70
-def white(p):  return min(p) > 200
-def black(p, t=24): return max(p) <= t
-def reddish(p): return p[0] - p[2] > 25 and p[0] > 40
-def region(x0, y0, x1, y1, pred):
-    return sum(1 for y in range(int(y0 * k), int(y1 * k)) for x in range(int(x0 * k), int(x1 * k))
-               if pred(im.getpixel((x, y))))
-def all_black(t=24):
-    return max(im.tobytes()) <= t
-ok = eval(sys.argv[3])
-sys.exit(0 if ok else 1)
-PY
+  SHOT_BG="$SHOT_BG" python3 -I "$ROOT/scripts/shotcheck.py" "$EVID/$1.png" "$2" "$3"
 }
 assert_shot() { # assert_shot <desc> <name> <lw> <expr>
   if check "$2" "$3" "$4"; then ok "$1 ($EVID/$2.png)"; else bad "$1 ($EVID/$2.png): $4"; fi
 }
 
+# environment, for diagnosing CI runs
+echo ">>> $(sway --version 2>&1 | head -1)"
+echo ">>> wlroots: $(ldd "$(command -v sway)" 2>/dev/null | grep -o 'libwlroots[^ ]*' | head -1)"
+[ -n "${CU_OVERLAY_DISABLE:-}" ] && echo ">>> CU_OVERLAY_DISABLE=$CU_OVERLAY_DISABLE"
+
+# The empty-output colour is the compositor's, not ours: black on sway >=
+# 1.10, dark gray (63,63,63) on the sway 1.9 of ubuntu-24.04. Take it from
+# screenshots of both outputs before any overlay exists; every "nothing of
+# ours here" assertion compares against it.
+sleep 0.3
+shot bg_1 HEADLESS-1
+shot bg_2 HEADLESS-2
+SHOT_BG="$(python3 -I -c "
+from PIL import Image
+im = Image.open('$EVID/bg_1.png').convert('RGB')
+print(','.join(map(str, max(im.getcolors(1 << 22))[1])))")"
+export SHOT_BG
+echo ">>> empty-output colour: $SHOT_BG"
+assert_shot "baseline: HEADLESS-1 is uniform before any overlay" bg_1 1280 'all_bg(8)'
+assert_shot "baseline: HEADLESS-2 is uniform and the same colour" bg_2 1280 'all_bg(8)'
+
 echo ">>> overlay A (all optional globals)"
 start_overlay a
 wait_event '"event":"ready"' && ok "ready: $LAST" || bad "no ready"
-[[ "$LAST" == *'"alphaModifier":true'* && "$LAST" == *'"fractionalScale":true'* && "$LAST" == *'"badge":false'* ]] \
-  && ok "ready reports alphaModifier, fractionalScale, badge:false" || bad "ready caps"
+[[ "$LAST" == *'"fractionalScale":true'* && "$LAST" == *'"badge":false'* && "$LAST" == *'"captureScopes":["all","cursor"]'* ]] \
+  && ok "ready reports fractionalScale, badge:false, captureScopes" || bad "ready caps"
+# alpha-modifier is optional (wlroots >= 0.18): the pulse is checked only with it
+ALPHA=0
+[[ "$LAST" == *'"alphaModifier":true'* ]] && ALPHA=1
+echo ">>> alphaModifier: $ALPHA"
 [[ "$LAST" == *'{"name":"HEADLESS-2","x":1280,"y":0,"width":1280,"height":800,"scale":1.5}'* ]] \
   && ok "ready lists HEADLESS-2 at 1280,0 1280x800 scale 1.5" || bad "ready outputs"
 
@@ -165,16 +171,16 @@ send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true,"arrow":{"x"
 wait_event '"event":"shown","output":"HEADLESS-1","scale":1\.0' && ok "shown on HEADLESS-1" || bad "shown"
 sleep 0.5
 shot rim HEADLESS-1
-assert_shot "rim on all four edges" rim 1280 'all(clay(px(*p)) for p in [(0,400),(1,400),(1279,400),(1278,400),(640,0),(640,1),(640,799),(640,798)]) and black(px(4,400)) and black(px(640,4))'
-assert_shot "interior untouched" rim 1280 'black(px(640,400)) and black(px(900,600))'
-assert_shot "arrow at (300,200): clay body down-right, white outline at the tip" rim 1280 'clay(px(312,212)) and region(296,195,304,203,white) > 4 and black(px(290,190)) and black(px(330,250))'
+assert_shot "rim on all four edges" rim 1280 'all(clay(px(*p)) for p in [(0,400),(1,400),(1279,400),(1278,400),(640,0),(640,1),(640,799),(640,798)]) and bg(px(4,400)) and bg(px(640,4))'
+assert_shot "interior untouched" rim 1280 'bg(px(640,400)) and bg(px(900,600))'
+assert_shot "arrow at (300,200): clay body down-right, white outline at the tip" rim 1280 'clay(px(312,212)) and region(296,195,304,203,white) > 4 and bg(px(290,190)) and bg(px(330,250))'
 
 # glow look: bands at the edges, no arrow
 send '{"cmd":"look","look":"glow"}'
 sleep 0.6
 shot glow HEADLESS-1
-assert_shot "glow bands on the edges" glow 1280 'reddish(px(3,400)) and reddish(px(640,3)) and reddish(px(1276,400)) and reddish(px(640,796)) and px(40,400)[0] > 25'
-assert_shot "glow fades toward the middle" glow 1280 'black(px(640,400)) and px(3,400)[0] > px(60,400)[0] > px(200,400)[0]'
+assert_shot "glow bands on the edges" glow 1280 'reddish(px(3,400)) and reddish(px(640,3)) and reddish(px(1276,400)) and reddish(px(640,796)) and px(40,400)[0] - BG[0] > 12'
+assert_shot "glow fades toward the middle" glow 1280 'bg(px(640,400)) and px(3,400)[0] > px(60,400)[0] > px(200,400)[0]'
 assert_shot "no arrow in the glow look" glow 1280 'not clay(px(312,212))'
 
 # the glow pulses: the edge brightness changes over a second
@@ -183,7 +189,9 @@ for i in 1 2 3 4; do shot "pulse$i" HEADLESS-1; sleep 0.5; done
 if python3 -I -c "
 from PIL import Image
 v=[Image.open('$EVID/pulse%d.png' % i).getpixel((3,400))[0] for i in (1,2,3,4)]
-import sys; print('    edge red', v); sys.exit(0 if max(v) - min(v) >= 8 else 1)"; then ok "glow pulses (alpha modifier)"; else bad "glow did not pulse"; fi
+import sys; print('    edge red', v); sys.exit(0 if (max(v) - min(v) >= 8) == ($ALPHA == 1) else 1)"; then
+  [ "$ALPHA" = 1 ] && ok "glow pulses (alpha modifier)" || ok "glow static (no alpha modifier, by design)"
+else bad "glow pulse does not match alphaModifier=$ALPHA"; fi
 
 # second output at scale 1.5 with an x offset
 send '{"cmd":"look","look":"rim"}'
@@ -193,9 +201,9 @@ send '{"cmd":"jump","x":1680,"y":300}'
 sleep 0.5
 shot out2 HEADLESS-2
 shot out1_after_move HEADLESS-1
-assert_shot "HEADLESS-1 empty after the move" out1_after_move 1280 'all_black()'
+assert_shot "HEADLESS-1 empty after the move" out1_after_move 1280 'all_bg()'
 assert_shot "rim on HEADLESS-2 (scale 1.5)" out2 1280 'clay(px(0.3,400)) and clay(px(1279.5,400)) and clay(px(640,0.3)) and clay(px(640,799.5))'
-assert_shot "arrow at global (1680,300) = local (400,300) on HEADLESS-2" out2 1280 'clay(px(412,312)) and region(396,295,404,303,white) > 4 and black(px(390,290))'
+assert_shot "arrow at global (1680,300) = local (400,300) on HEADLESS-2" out2 1280 'clay(px(412,312)) and region(396,295,404,303,white) > 4 and bg(px(390,290))'
 python3 -I -c "
 from PIL import Image; im=Image.open('$EVID/out2.png'); print('    HEADLESS-2 screenshot', im.size)"
 
@@ -225,7 +233,7 @@ assert_shot "glide rests on the last frame (900,300 local)" glide_end 1280 'clay
 send '{"cmd":"capture","phase":"hide","id":5}'
 wait_event '"event":"ack","id":5' && ok "capture hide acked" || bad "capture hide ack"
 shot cap_hidden HEADLESS-2
-assert_shot "fully transparent during a capture hide" cap_hidden 1280 'all_black()'
+assert_shot "fully transparent during a capture hide" cap_hidden 1280 'all_bg()'
 send '{"cmd":"capture","phase":"restore","id":6}'
 wait_event '"event":"ack","id":6' && ok "capture restore acked" || bad "capture restore ack"
 shot cap_restored HEADLESS-2
@@ -255,7 +263,7 @@ assert_shot "after restore the arrow is back at its pose (local 900,300)" cap_cu
 send '{"cmd":"capture","phase":"hide","id":23,"scope":"all"}'
 wait_event '"event":"ack","id":23' || bad "ack 23"
 shot cap_all HEADLESS-2
-assert_shot "scope=all: fully transparent as before" cap_all 1280 'all_black()'
+assert_shot "scope=all: fully transparent as before" cap_all 1280 'all_bg()'
 send '{"cmd":"capture","phase":"restore","id":24}'
 wait_event '"event":"ack","id":24' || bad "ack 24"
 sleep 1.2
@@ -276,8 +284,8 @@ assert_shot "still shown on HEADLESS-2 after the bad move" move_bad 1280 'clay(p
 send '{"cmd":"hide"}'
 wait_event '"event":"hidden"' && ok "hidden" || bad "hidden"
 shot hidden2 HEADLESS-2; shot hidden1 HEADLESS-1
-assert_shot "nothing left on HEADLESS-2 after hide" hidden2 1280 'all_black()'
-assert_shot "nothing left on HEADLESS-1 after hide" hidden1 1280 'all_black()'
+assert_shot "nothing left on HEADLESS-2 after hide" hidden2 1280 'all_bg()'
+assert_shot "nothing left on HEADLESS-1 after hide" hidden1 1280 'all_bg()'
 
 # a later show creates a new surface
 send '{"cmd":"show","output":"HEADLESS-1","look":"rim","arrow":null}'
@@ -353,7 +361,7 @@ send '{"cmd":"show","output":"HEADLESS-1","look":"glow"}'
 wait_event '"event":"shown"' || bad "shown b"
 sleep 0.3
 shot b_glow HEADLESS-1; sleep 0.8; shot b_glow2 HEADLESS-1
-assert_shot "static glow drawn" b_glow 1280 'reddish(px(3,400)) and black(px(640,400))'
+assert_shot "static glow drawn" b_glow 1280 'reddish(px(3,400)) and bg(px(640,400))'
 if python3 -I -c "
 from PIL import Image
 a=Image.open('$EVID/b_glow.png').getpixel((3,400)); b=Image.open('$EVID/b_glow2.png').getpixel((3,400))
@@ -363,7 +371,7 @@ send '{"cmd":"jump","x":500,"y":300}'
 send '{"cmd":"capture","phase":"hide","id":1}'
 wait_event '"event":"ack","id":1' || bad "ack b1"
 shot b_cap HEADLESS-1
-assert_shot "capture hide without alpha modifier is fully transparent" b_cap 1280 'all_black()'
+assert_shot "capture hide without alpha modifier is fully transparent" b_cap 1280 'all_bg()'
 send '{"cmd":"capture","phase":"restore","id":2}'
 wait_event '"event":"ack","id":2' || bad "ack b2"
 shot b_restored HEADLESS-1
@@ -371,7 +379,7 @@ assert_shot "restored without alpha modifier" b_restored 1280 'clay(px(0,400)) a
 send '{"cmd":"hide"}'
 wait_event '"event":"hidden"' 1 && ok "instant hide" || bad "hide b"
 shot b_hidden HEADLESS-1
-assert_shot "nothing left (no alpha modifier)" b_hidden 1280 'all_black()'
+assert_shot "nothing left (no alpha modifier)" b_hidden 1280 'all_bg()'
 exec 3>&-
 wait "$OPID" || bad "overlay b exit $?"
 
@@ -431,7 +439,7 @@ send '{"cmd":"press","x":1680,"y":300}'
 wait_event '"event":"error","message":"arrow outside output HEADLESS-1","fatal":false' && ok "press off the output: non-fatal error" || bad "press off-output error"
 sleep 0.15
 shot g_off2 HEADLESS-2; shot g_off1 HEADLESS-1
-assert_shot "nothing drawn on HEADLESS-2 for an off-output jump + press" g_off2 1280 'all_black()'
+assert_shot "nothing drawn on HEADLESS-2 for an off-output jump + press" g_off2 1280 'all_bg()'
 assert_shot "HEADLESS-1 keeps its rim, no arrow or ring anywhere on it" g_off1 1280 'clay(px(0,400)) and clay(px(1279,400)) and region(4,4,1276,796,reddish) == 0'
 kill -0 "$OPID" 2>/dev/null && ok "alive after off-output commands" || bad "died on off-output commands"
 # move to the output the pose is on: drawn there without resending it
@@ -441,14 +449,14 @@ wait_event '"event":"shown","output":"HEADLESS-2"' || bad "shown g2"
 sleep 0.4
 shot g_moved2 HEADLESS-2; shot g_moved1 HEADLESS-1
 assert_shot "after move: rim and the kept arrow (1680,300 = local 400,300) on HEADLESS-2" g_moved2 1280 'clay(px(0.3,400)) and clay(px(412,312)) and region(396,295,404,303,white) > 4'
-assert_shot "after move: nothing left on HEADLESS-1" g_moved1 1280 'all_black()'
+assert_shot "after move: nothing left on HEADLESS-1" g_moved1 1280 'all_bg()'
 # straddling the shared edge from HEADLESS-1: arrow box and ring cut at x = 1280
 send '{"cmd":"move","output":"HEADLESS-1"}'
 wait_event '"event":"shown","output":"HEADLESS-1"' || bad "shown g3"
 send '{"cmd":"press","x":1276,"y":400}'
 sleep 0.05
 shot g_edge2 HEADLESS-2; shot g_edge1 HEADLESS-1
-assert_shot "straddling from HEADLESS-1: no pixel of ours on HEADLESS-2" g_edge2 1280 'all_black()'
+assert_shot "straddling from HEADLESS-1: no pixel of ours on HEADLESS-2" g_edge2 1280 'all_bg()'
 assert_shot "straddling from HEADLESS-1: the arrow tip and the ring's left half on HEADLESS-1" g_edge1 1280 'region(1270,396,1280,412,clay) > 3 and region(1200,340,1266,460,lambda p: p[0] - p[2] > 8) > 10'
 # straddling from HEADLESS-2 (scale 1.5) toward HEADLESS-1
 sleep 1.2
@@ -457,7 +465,7 @@ wait_event '"event":"shown","output":"HEADLESS-2"' || bad "shown g4"
 send '{"cmd":"press","x":1283,"y":300}'
 sleep 0.2
 shot g_edge1b HEADLESS-1; shot g_edge2b HEADLESS-2
-assert_shot "straddling from HEADLESS-2: no pixel of ours on HEADLESS-1" g_edge1b 1280 'all_black()'
+assert_shot "straddling from HEADLESS-2: no pixel of ours on HEADLESS-1" g_edge1b 1280 'all_bg()'
 assert_shot "straddling from HEADLESS-2: the arrow at local (3,300) on HEADLESS-2" g_edge2b 1280 'region(0,295,30,330,clay) > 5'
 # a glide that leaves the output: one error, no arrow drawn once it is off
 sleep 1.2
@@ -469,7 +477,7 @@ wait_event '"event":"error","message":"arrow outside output HEADLESS-2","fatal":
 sleep 0.6
 [ "$(grep -c 'arrow outside output' "$OUT")" = 3 ] && ok "exactly one error per off-output command" || bad "error count $(grep -c 'arrow outside output' "$OUT")"
 shot g_glide1 HEADLESS-1; shot g_glide2 HEADLESS-2
-assert_shot "glide end off the output: nothing on HEADLESS-1" g_glide1 1280 'all_black()'
+assert_shot "glide end off the output: nothing on HEADLESS-1" g_glide1 1280 'all_bg()'
 assert_shot "glide end off the output: HEADLESS-2 rim only" g_glide2 1280 'clay(px(0.3,400)) and region(4,4,1276,796,clay) == 0'
 exec 3>&-
 wait "$OPID" || bad "overlay g exit $?"
@@ -533,7 +541,7 @@ wait "$OPID" 2>/dev/null || true
 exec 3>&-
 sleep 0.2
 shot d_after HEADLESS-1
-assert_shot "no surface left after parent death" d_after 1280 'all_black()'
+assert_shot "no surface left after parent death" d_after 1280 'all_bg()'
 
 echo
 echo "passed: $pass, failed: $fail"

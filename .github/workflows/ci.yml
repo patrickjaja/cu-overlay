@@ -130,3 +130,4 @@ jobs:
           name: headless-sway-evidence
           path: ${{ runner.temp }}/evidence
           if-no-files-found: ignore
+          retention-days: 14
