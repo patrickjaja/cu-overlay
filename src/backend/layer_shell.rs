@@ -855,6 +855,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for St {
             } if interface == "wl_output" => bind_output(st, registry, name, version, qh),
             wl_registry::Event::GlobalRemove { name } => {
                 if let Some(i) = st.outputs.iter().position(|o| o.global == name) {
+                    st.events.push(BackendEvent::OutputsChanged);
                     let o = st.outputs.remove(i);
                     if let Some(x) = o.xdg {
                         x.destroy();
@@ -912,7 +913,7 @@ impl Dispatch<wl_output::WlOutput, u32> for St {
             }
             wl_output::Event::Scale { factor } => o.int_scale = factor,
             wl_output::Event::Name { name } => o.name = Some(name),
-            wl_output::Event::Done => st.events.push(BackendEvent::Changed),
+            wl_output::Event::Done => st.events.push(BackendEvent::OutputsChanged),
             _ => {}
         }
     }
@@ -936,6 +937,8 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for St {
                 o.logical_size = Some((width, height))
             }
             zxdg_output_v1::Event::Name { name } if o.name.is_none() => o.name = Some(name),
+            // xdg_output < 3 has its own done; deduplicated by the run loop
+            zxdg_output_v1::Event::Done => st.events.push(BackendEvent::OutputsChanged),
             _ => {}
         }
     }

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::backend::{Backend, BackendEvent};
 use crate::controller::{Action, Controller, Scene};
+use crate::geom::OutputInfo;
 use crate::protocol::{Event, MAX_LINE, PROTOCOL, parse_command};
 use crate::sys::{self, Parent, ReadResult};
 
@@ -78,6 +79,8 @@ struct Loop<B: Backend, W: Write> {
     last_present: Instant,
     last_scene: Option<Scene>,
     exit: Option<u8>,
+    /// The output list last reported (`ready` or `outputs`).
+    sent_outputs: Vec<OutputInfo>,
 }
 
 impl<B: Backend, W: Write> Loop<B, W> {
@@ -170,6 +173,14 @@ impl<B: Backend, W: Write> Loop<B, W> {
                 self.dirty = true;
             }
             BackendEvent::Frame | BackendEvent::Changed => self.dirty = true,
+            BackendEvent::OutputsChanged => {
+                self.dirty = true;
+                let now = self.be.outputs();
+                if now != self.sent_outputs {
+                    self.sent_outputs = now.clone();
+                    self.emit(&Event::Outputs { outputs: now });
+                }
+            }
             BackendEvent::Synced(t) => match self.pending.remove(&t) {
                 Some(Pending::Ack(id)) => self.emit(&Event::Ack { id }),
                 Some(Pending::Hidden) => self.emit(&Event::Hidden),
@@ -237,6 +248,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         last_present: now,
         last_scene: None,
         exit: None,
+        sent_outputs: Vec::new(),
     };
     let ready = Event::Ready {
         protocol: PROTOCOL,
@@ -246,6 +258,9 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         badge: false,
         outputs: l.be.outputs(),
     };
+    if let Event::Ready { outputs, .. } = &ready {
+        l.sent_outputs = outputs.clone();
+    }
     l.emit(&ready);
 
     let mut lines = LineReader::default();

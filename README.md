@@ -43,6 +43,7 @@ Claude Desktop spawns `<bridge> overlay` and talks to it over pipes, one JSON ob
 | Line | When |
 |---|---|
 | `{"event":"ready","protocol":1,"backend":"layer-shell","alphaModifier":<bool>,"fractionalScale":<bool>,"badge":false,"outputs":[{"name":..,"x":..,"y":..,"width":..,"height":..,"scale":..}]}` | once, after connecting. `width`/`height` are logical; `scale` is the output's (fractional) scale |
+| `{"event":"outputs","outputs":[...]}` | the output layout changed after `ready` (hotplug, unplug, mode, scale, position): the full list, same shape as in `ready`. Sent only when the list actually differs from the last one reported |
 | `{"event":"shown","output":"<name>","scale":<f64>}` | the overlay is on screen (after `show` or `move`); `scale` is the buffer scale in use |
 | `{"event":"hidden"}` | after `hide` (once the surfaces are destroyed), or after the compositor took them away |
 | `{"event":"ack","id":<n>}` | a `capture` took effect and the compositor processed it |
@@ -53,7 +54,7 @@ Claude Desktop spawns `<bridge> overlay` and talks to it over pipes, one JSON ob
 | Command | Effect |
 |---|---|
 | `{"cmd":"show","output":"<name>","look":"glow"\|"rim","badge":<bool>,"reducedMotion":<bool>,"arrow":{"x":..,"y":..}\|null}` | Show on an output (fade in 300 ms). `look` defaults to `glow`. A `glow` show never draws the arrow; `rim` draws it at `arrow` when given, otherwise from the first `jump`/`glide`/`press`. `badge` is accepted and ignored in protocol 1 (see Limits). `reducedMotion`: static glow, glides jump to their last frame, a press only fades the ring (600 ms, no bloom, no bump). A `show` while shown updates look, arrow and motion setting in place; on another output it moves |
-| `{"cmd":"move","output":"<name>"}` | Follow a display switch: recreate the surfaces on that output, keeping look and arrow |
+| `{"cmd":"move","output":"<name>"}` | Follow a display switch: recreate the surfaces on that output, keeping look and arrow. An unknown output is a NON-fatal `error` (`move: unknown output: <name>`); the overlay stays where it is |
 | `{"cmd":"glide","frames":[[x,y,deg,lift],...],"frameMs":16}` | Play the frames `frameMs` apart (default 16, 1..1000), linearly interpolated; the last frame is the resting pose. `deg` and `lift` may be omitted (0). Up to 4096 frames. The caller computes the frames (upstream's glide planner) |
 | `{"cmd":"jump","x":..,"y":..}` | Place the arrow, no animation |
 | `{"cmd":"press","x":..,"y":..}` | Snap the arrow there and play ring + bloom + bump. The ring stays at the press point if a glide follows |
@@ -70,10 +71,12 @@ Unknown commands and malformed lines (bad JSON, missing fields, out-of-range num
 | stdin EOF (a last line without newline still runs) | 0 |
 | parent death: `PR_SET_PDEATHSIG` = SIGTERM, plus a check every 500 ms of `CLAUDE_CU_PARENT_PID` (by pid and start time, as in cu-abort-watch) or of `getppid` | 0 (SIGTERM: killed by the signal) |
 | no Wayland display, no wlr-layer-shell | 2, after a fatal `error`; nothing created |
-| `show`/`move` naming an output that does not exist | 2, after `{"event":"error","message":"unknown output: <name>","fatal":true}` |
+| `show` naming an output that does not exist | 2, after `{"event":"error","message":"unknown output: <name>","fatal":true}` |
 | Wayland connection lost, stdout closed | 1 |
 
-The surfaces belong to the process's Wayland connection, so any exit (also SIGKILL) removes them. An output that is unplugged while shown closes the surfaces: a non-fatal `error` plus `hidden` follow, and the bridge sends `show` again for another output.
+The surfaces belong to the process's Wayland connection, so any exit (also SIGKILL) removes them. An output that is unplugged while shown closes the surfaces: a non-fatal `error` (`the compositor closed the overlay surface`), `hidden` and an `outputs` event without it follow; the process stays alive and the bridge sends `show` again for another output.
+
+To map a display to an output name, use `ready`'s `outputs` and every later `outputs` event: each entry is the output's name with its global logical `x`, `y`, `width`, `height` and `scale`, the same layout `screens` reports.
 
 ## Use from a bridge
 
@@ -91,7 +94,7 @@ Command::Overlay => return cu_overlay::run(std::io::stdin(), std::io::stdout()),
 ```
 
 ```rust
-pub fn run<R: AsFd, W: Write>(input: R, output: W) -> ExitCode;          // layer-shell backend
+pub fn run<R: AsFd, W: Write>(input: R, output: W) -> std::process::ExitCode;  // layer-shell backend
 pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) -> ExitCode;
 pub const PARENT_PID_ENV: &str = "CLAUDE_CU_PARENT_PID";
 ```
@@ -121,7 +124,7 @@ cargo run --release --example bench -- 1.5              # per-frame draw cost
 
 Debugging: `CU_OVERLAY_DEBUG=1` prints redraw and commit counts to stderr at exit; `CU_OVERLAY_DISABLE=alpha-modifier,fractional-scale,viewporter` ignores those globals to exercise the fallbacks.
 
-The integration test drives `cu-overlay-demo` on two headless outputs (the second at x = 1280 and scale 1.5) and asserts on `wlroots-bridge screenshot` captures: rim on all four edges, glow bands and pulse, the arrow at the requested global point on both outputs, the press ring, a glide's mid-flight and resting pose, full transparency during a capture hide, the 3 s auto-restore, nothing left after `hide` or parent death, a click at the arrow reaching the window below (sway seat + two `foot` windows, focus checked via `swaymsg -t get_tree`), and the fallbacks without alpha-modifier and without viewporter.
+The integration test drives `cu-overlay-demo` on two headless outputs (the second at x = 1280 and scale 1.5) and asserts on `wlroots-bridge screenshot` captures: rim on all four edges, glow bands and pulse, the arrow at the requested global point on both outputs, the press ring, a glide's mid-flight and resting pose, full transparency during a capture hide, the 3 s auto-restore, a `move` to an unknown output staying non-fatal, a hot-plugged third output reported in an `outputs` event and then unplugged while shown (non-fatal error, `hidden`, process alive, `show` on a remaining output works), nothing left after `hide` or parent death, a click at the arrow reaching the window below (sway seat + two `foot` windows, focus checked via `swaymsg -t get_tree`), and the fallbacks without alpha-modifier and without viewporter.
 
 ## Fallbacks and limits
 

@@ -225,6 +225,11 @@ pub enum Event {
         scale: f64,
     },
     Hidden,
+    /// The output layout changed (hotplug, mode, scale, position): the full
+    /// list, same shape as in `ready`.
+    Outputs {
+        outputs: Vec<OutputInfo>,
+    },
     Ack {
         id: u64,
     },
@@ -381,6 +386,10 @@ mod tests {
             "{\"event\":\"ready\",\"protocol\":1,\"backend\":\"layer-shell\",\"alphaModifier\":true,\"fractionalScale\":false,\"badge\":false,\"outputs\":[{\"name\":\"HEADLESS-1\",\"x\":0,\"y\":0,\"width\":1280,\"height\":800,\"scale\":1.0}]}\n"
         );
         assert_eq!(Event::Hidden.line(), "{\"event\":\"hidden\"}\n");
+        assert_eq!(
+            Event::Outputs { outputs: vec![] }.line(),
+            "{\"event\":\"outputs\",\"outputs\":[]}\n"
+        );
         assert_eq!(
             Event::Ack { id: 3 }.line(),
             "{\"event\":\"ack\",\"id\":3}\n"

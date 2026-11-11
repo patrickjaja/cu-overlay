@@ -36,6 +36,8 @@ pub enum BackendEvent {
     Closed(String),
     /// Size or scale changed: present again.
     Changed,
+    /// An output appeared, disappeared or changed (see [`Backend::outputs`]).
+    OutputsChanged,
 }
 
 /// A windowing-system backend driven by [`crate::run_with`]. All methods run

@@ -189,7 +189,11 @@ impl Controller {
             }
             Command::Move { output } => {
                 if !known(&output) {
-                    return Self::unknown_output(&output);
+                    // not fatal: keep showing where we are
+                    return vec![Action::Emit(Event::error(
+                        format!("move: unknown output: {output}"),
+                        false,
+                    ))];
                 }
                 if self.output.as_deref() == Some(&output) {
                     return vec![];
@@ -461,8 +465,25 @@ mod tests {
             &a[0],
             Action::Emit(Event::Error { fatal: true, .. })
         ));
+    }
+
+    #[test]
+    fn move_to_unknown_output_is_not_fatal() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim"}"#),
+            t0,
+            &outs(),
+        );
         let a = c.handle(cmd(r#"{"cmd":"move","output":"Z"}"#), t0, &outs());
-        assert_eq!(a[1], Action::Exit(2));
+        assert_eq!(a.len(), 1);
+        assert!(matches!(
+            &a[0],
+            Action::Emit(Event::Error { fatal: false, .. })
+        ));
+        assert_eq!(c.output(), Some("A"));
+        assert!(c.scene(t0).is_some(), "still shown");
     }
 
     #[test]

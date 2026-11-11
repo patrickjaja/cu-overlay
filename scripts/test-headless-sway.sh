@@ -243,6 +243,12 @@ send 'this is not json'
 wait_event '"event":"error".*"fatal":false' && ok "malformed line: non-fatal error" || bad "malformed"
 send '{"cmd":"warp"}'
 wait_event '"event":"error".*"fatal":false' && ok "unknown command: non-fatal error" || bad "unknown cmd"
+send '{"cmd":"move","output":"NOPE-9"}'
+wait_event '"event":"error","message":"move: unknown output: NOPE-9","fatal":false' && ok "move to an unknown output: non-fatal error" || bad "move unknown"
+sleep 0.3
+kill -0 "$OPID" 2>/dev/null && ok "still running after the bad move" || bad "died on a bad move"
+shot move_bad HEADLESS-2
+assert_shot "still shown on HEADLESS-2 after the bad move" move_bad 1280 'clay(px(0.3,400)) and clay(px(912,312))'
 
 # hide: fade, destroy, nothing left
 send '{"cmd":"hide"}'
@@ -358,6 +364,37 @@ shot e_rim HEADLESS-2
 assert_shot "rim and arrow without viewporter" e_rim 1280 'clay(px(0.3,400)) and clay(px(1279.5,400)) and clay(px(412,312)) and region(396,295,404,303,white) > 4'
 exec 3>&-
 wait "$OPID" || bad "overlay e exit $?"
+
+echo ">>> overlay F (output hot-plug and unplug while shown)"
+SEEN=0
+start_overlay f
+wait_event '"event":"ready"' || bad "ready f"
+swaymsg -q create_output
+swaymsg -q output HEADLESS-3 resolution 800x600 position 2560 0 scale 1
+wait_event '"event":"outputs".*"name":"HEADLESS-3","x":2560,"y":0,"width":800,"height":600,"scale":1\.0' \
+  && ok "outputs event on hot-plug: $LAST" || bad "no outputs event for HEADLESS-3"
+send '{"cmd":"show","output":"HEADLESS-3","look":"rim","arrow":{"x":2700,"y":100}}'
+wait_event '"event":"shown","output":"HEADLESS-3"' && ok "shown on the hot-plugged HEADLESS-3" || bad "shown f"
+sleep 0.3
+shot f_on3 HEADLESS-3
+assert_shot "rim and arrow on HEADLESS-3 (global 2700,100 = local 140,100)" f_on3 800 'clay(px(0,300)) and clay(px(152,112))'
+if swaymsg -q output HEADLESS-3 unplug; then
+  wait_event '"event":"error","message":"the compositor closed the overlay surface","fatal":false' && ok "unplug: non-fatal error" || bad "unplug error event"
+  wait_event '"event":"hidden"' && ok "unplug: hidden" || bad "unplug hidden"
+  sleep 0.3
+  grep -q '"event":"outputs","outputs":\[{"name":"HEADLESS-1".*"HEADLESS-2"[^]]*\]}$' "$OUT" && ! tail -n1 "$OUT" | grep -q HEADLESS-3 \
+    && ok "outputs event without HEADLESS-3" || { tail -n3 "$OUT"; bad "outputs event after unplug"; }
+  kill -0 "$OPID" 2>/dev/null && ok "overlay alive after the unplug" || bad "overlay died on unplug"
+  send '{"cmd":"show","output":"HEADLESS-1","look":"rim","arrow":{"x":300,"y":200}}'
+  wait_event '"event":"shown","output":"HEADLESS-1"' && ok "show on a remaining output after the unplug" || bad "re-show f"
+  sleep 0.3
+  shot f_on1 HEADLESS-1
+  assert_shot "rim and arrow on HEADLESS-1 after the unplug" f_on1 1280 'clay(px(0,400)) and clay(px(312,212))'
+else
+  echo "  SKIP unplug (this sway cannot unplug a headless output)"
+fi
+exec 3>&-
+wait "$OPID" || bad "overlay f exit $?"
 
 echo ">>> overlay C (unknown output is fatal)"
 SEEN=0
