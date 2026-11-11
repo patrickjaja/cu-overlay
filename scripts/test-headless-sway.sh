@@ -64,8 +64,8 @@ cleanup() {
   for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
   [ -n "${SWAY_PID:-}" ] && kill "$SWAY_PID" 2>/dev/null || true
   wait 2>/dev/null || true
-  [ -z "${EVIDENCE_DIR:-}" ] && rm -rf "$RUN"
-  [ -n "${EVIDENCE_DIR:-}" ] && rm -rf "${RUN:?}/"wayland-* "$RUN"/*.fifo 2>/dev/null
+  # with EVIDENCE_DIR the screenshots live outside $RUN
+  rm -rf "${RUN:?}"
   true
 }
 trap cleanup EXIT
