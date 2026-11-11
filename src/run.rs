@@ -256,6 +256,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         alpha_modifier: caps.alpha_modifier,
         fractional_scale: caps.fractional_scale,
         badge: false,
+        capture_scopes: crate::protocol::CAPTURE_SCOPES,
         outputs: l.be.outputs(),
     };
     if let Event::Ready { outputs, .. } = &ready {

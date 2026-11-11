@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::anim::{self, Glide, PressFrame};
 use crate::geom::OutputInfo;
-use crate::protocol::{CapturePhase, Command, Event, Look, Pose};
+use crate::protocol::{CapturePhase, CaptureScope, Command, Event, Look, Pose};
 
 /// A `capture` hide that sees no `restore` ends by itself after this long,
 /// so a bridge that died mid-screenshot never leaves the overlay invisible.
@@ -93,7 +93,8 @@ pub struct Controller {
     rest: Option<Pose>,
     glide: Option<(Glide, Instant)>,
     press: Option<(f64, f64, Instant)>,
-    capture_until: Option<Instant>,
+    /// A capture hide in force: its scope and auto-restore deadline.
+    capture: Option<(CaptureScope, Instant)>,
     pulse_epoch: Instant,
 }
 
@@ -112,7 +113,7 @@ impl Controller {
             rest: None,
             glide: None,
             press: None,
-            capture_until: None,
+            capture: None,
             pulse_epoch: now,
         }
     }
@@ -281,9 +282,17 @@ impl Controller {
                     vec![Action::Destroy]
                 }
             },
-            Command::Capture { phase, id } => {
-                self.capture_until = match phase {
-                    CapturePhase::Hide => Some(now + CAPTURE_AUTO_RESTORE),
+            Command::Capture { phase, id, scope } => {
+                self.capture = match phase {
+                    // not nested: a second hide widens to the larger scope
+                    // and restarts the auto-restore clock; one restore ends it
+                    CapturePhase::Hide => {
+                        let scope = match self.capture {
+                            Some((CaptureScope::All, _)) => CaptureScope::All,
+                            _ => scope,
+                        };
+                        Some((scope, now + CAPTURE_AUTO_RESTORE))
+                    }
                     CapturePhase::Restore => None,
                 };
                 vec![Action::Redraw, Action::Ack(id)]
@@ -314,10 +323,10 @@ impl Controller {
             self.press = None;
             out.push(Action::Redraw);
         }
-        if let Some(until) = self.capture_until
+        if let Some((_, until)) = self.capture
             && now >= until
         {
-            self.capture_until = None;
+            self.capture = None;
             out.push(Action::Emit(Event::error(
                 format!(
                     "capture: no restore within {} ms, overlay restored",
@@ -348,7 +357,7 @@ impl Controller {
             };
             min(t + Duration::from_secs_f64(ms / 1000.0));
         }
-        if let Some(t) = self.capture_until {
+        if let Some((_, t)) = self.capture {
             min(t);
         }
         d
@@ -362,8 +371,13 @@ impl Controller {
         self.glide = None;
     }
 
+    /// The scope of the capture hide in force, if any.
+    pub fn capture_scope(&self) -> Option<CaptureScope> {
+        self.capture.map(|(s, _)| s)
+    }
+
     pub fn capture_hidden(&self) -> bool {
-        self.capture_until.is_some()
+        self.capture_scope() == Some(CaptureScope::All)
     }
 
     /// What to draw now; `None` while hidden.
@@ -388,7 +402,12 @@ impl Controller {
                 frame,
             })
         });
+        // a cursor-scope capture hide drops the arrow and ring from the
+        // frame; their clocks keep running, so restore shows the current pose
+        // and a ring only while its animation still runs
+        let cursor_off = self.capture.is_some();
         let arrow = match (self.look, self.pose(now)) {
+            _ if cursor_off => None,
             (Look::Rim, Some(pose)) => Some(ArrowDraw {
                 pose,
                 scale: press.map_or(1.0, |p| p.frame.arrow_scale),
@@ -403,8 +422,12 @@ impl Controller {
             pulse,
             arrow,
             // the ring belongs to the drawn cursor (rim look only)
-            press: if self.look == Look::Rim { press } else { None },
-            animating: fading || self.glide.is_some() || press.is_some(),
+            press: if self.look == Look::Rim && !cursor_off {
+                press
+            } else {
+                None
+            },
+            animating: fading || (!cursor_off && (self.glide.is_some() || press.is_some())),
         })
     }
 }
@@ -755,6 +778,164 @@ mod tests {
         assert_eq!(a[1], Action::Redraw);
         assert_eq!(c.scene(ms(t0, 4000)).unwrap().opacity, 1.0);
         assert_eq!(c.next_deadline(), None);
+    }
+
+    #[test]
+    fn capture_cursor_scope_keeps_the_rim_and_drops_arrow_and_ring() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","arrow":{"x":0,"y":0}}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(
+            cmd(r#"{"cmd":"press","x":10,"y":10}"#),
+            ms(t0, 400),
+            &outs(),
+        );
+        c.handle(
+            cmd(r#"{"cmd":"glide","frames":[[10,10],[110,10],[210,10],[310,10]],"frameMs":100}"#),
+            ms(t0, 450),
+            &outs(),
+        );
+        let a = c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":1,"scope":"cursor"}"#),
+            ms(t0, 500),
+            &outs(),
+        );
+        assert_eq!(a, vec![Action::Redraw, Action::Ack(1)]);
+        let s = c.scene(ms(t0, 550)).unwrap();
+        assert_eq!(s.opacity, 1.0, "rim untouched");
+        assert!(s.arrow.is_none() && s.press.is_none());
+        assert!(
+            !s.animating,
+            "nothing to animate while the cursor is hidden"
+        );
+        assert!(!c.capture_hidden());
+        assert_eq!(c.capture_scope(), Some(CaptureScope::Cursor));
+        // idempotent: a second hide acks again, no nesting
+        let a = c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":2,"scope":"cursor"}"#),
+            ms(t0, 600),
+            &outs(),
+        );
+        assert_eq!(a, vec![Action::Redraw, Action::Ack(2)]);
+        // the glide's clock kept running: restore shows the CURRENT pose
+        c.tick(ms(t0, 700));
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"restore","id":3}"#),
+            ms(t0, 700),
+            &outs(),
+        );
+        let s = c.scene(ms(t0, 700)).unwrap();
+        let p = s.arrow.unwrap().pose;
+        assert!(
+            (p.x - 260.0).abs() < 1e-6,
+            "pose at 250 ms into the glide: {p:?}"
+        );
+        // the press (400 ms + 1100 ms) still runs: the ring comes back mid-way
+        let ring = s.press.unwrap();
+        assert!(ring.frame.ring_scale > 1.0);
+    }
+
+    #[test]
+    fn capture_restore_does_not_replay_a_finished_ring() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","arrow":{"x":5,"y":5}}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(cmd(r#"{"cmd":"press","x":5,"y":5}"#), t0, &outs());
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":1,"scope":"cursor"}"#),
+            ms(t0, 100),
+            &outs(),
+        );
+        c.tick(ms(t0, 1200)); // the ring ended while hidden
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"restore","id":2}"#),
+            ms(t0, 1300),
+            &outs(),
+        );
+        let s = c.scene(ms(t0, 1300)).unwrap();
+        assert!(s.press.is_none(), "finished ring not replayed");
+        assert_eq!(s.arrow.unwrap().pose, Pose::at(5.0, 5.0));
+        // even without the tick, a ring past its end is not drawn
+        c.handle(cmd(r#"{"cmd":"press","x":5,"y":5}"#), ms(t0, 2000), &outs());
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":3,"scope":"cursor"}"#),
+            ms(t0, 2000),
+            &outs(),
+        );
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"restore","id":4}"#),
+            ms(t0, 3200),
+            &outs(),
+        );
+        assert!(c.scene(ms(t0, 3200)).unwrap().press.is_none());
+    }
+
+    #[test]
+    fn capture_cursor_scope_auto_restores_and_widens_to_all() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","arrow":{"x":5,"y":5}}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":1,"scope":"cursor"}"#),
+            ms(t0, 500),
+            &outs(),
+        );
+        assert_eq!(c.next_deadline(), Some(ms(t0, 3500)));
+        let a = c.tick(ms(t0, 3500));
+        assert!(matches!(
+            &a[0],
+            Action::Emit(Event::Error { fatal: false, .. })
+        ));
+        assert!(c.scene(ms(t0, 3500)).unwrap().arrow.is_some());
+        // cursor then all: all wins; all then cursor: stays all
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":2,"scope":"cursor"}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":3}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        assert_eq!(c.capture_scope(), Some(CaptureScope::All));
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":4,"scope":"cursor"}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        assert_eq!(c.capture_scope(), Some(CaptureScope::All));
+        assert_eq!(c.scene(ms(t0, 4000)).unwrap().opacity, 0.0);
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"restore","id":5}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        assert_eq!(c.capture_scope(), None);
+        // a cursor hide with nothing of the cursor visible (glow look) still acks
+        c.handle(
+            cmd(r#"{"cmd":"look","look":"glow"}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        let a = c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":6,"scope":"cursor"}"#),
+            ms(t0, 4000),
+            &outs(),
+        );
+        assert_eq!(a, vec![Action::Redraw, Action::Ack(6)]);
     }
 
     #[test]

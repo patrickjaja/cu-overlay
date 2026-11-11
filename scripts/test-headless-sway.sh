@@ -239,6 +239,27 @@ sleep 0.2
 shot cap_auto HEADLESS-2
 assert_shot "overlay back after the auto-restore" cap_auto 1280 'clay(px(0.3,400)) and clay(px(912,312))'
 
+# capture scope=cursor: only the arrow and a running ring go, the rim stays
+send '{"cmd":"press","x":2180,"y":300}'
+sleep 0.05
+send '{"cmd":"capture","phase":"hide","id":20,"scope":"cursor"}'
+wait_event '"event":"ack","id":20' && ok "capture hide scope=cursor acked" || bad "ack 20"
+shot cap_cursor HEADLESS-2
+assert_shot "scope=cursor: rim on all four edges, no arrow or ring pixels" cap_cursor 1280 'clay(px(0.3,400)) and clay(px(1279.5,400)) and clay(px(640,0.3)) and clay(px(640,799.5)) and region(4,4,1276,796,reddish) == 0 and region(4,4,1276,796,white) == 0'
+send '{"cmd":"capture","phase":"hide","id":21,"scope":"cursor"}'
+wait_event '"event":"ack","id":21' && ok "second hide is idempotent (acked)" || bad "ack 21"
+send '{"cmd":"capture","phase":"restore","id":22}'
+wait_event '"event":"ack","id":22' && ok "capture restore after scope=cursor acked" || bad "ack 22"
+shot cap_cursor_back HEADLESS-2
+assert_shot "after restore the arrow is back at its pose (local 900,300)" cap_cursor_back 1280 'clay(px(0.3,400)) and clay(px(912,312)) and region(896,295,904,303,white) > 4'
+send '{"cmd":"capture","phase":"hide","id":23,"scope":"all"}'
+wait_event '"event":"ack","id":23' || bad "ack 23"
+shot cap_all HEADLESS-2
+assert_shot "scope=all: fully transparent as before" cap_all 1280 'all_black()'
+send '{"cmd":"capture","phase":"restore","id":24}'
+wait_event '"event":"ack","id":24' || bad "ack 24"
+sleep 1.2
+
 # malformed input keeps the overlay running
 send 'this is not json'
 wait_event '"event":"error".*"fatal":false' && ok "malformed line: non-fatal error" || bad "malformed"
@@ -452,6 +473,39 @@ assert_shot "glide end off the output: nothing on HEADLESS-1" g_glide1 1280 'all
 assert_shot "glide end off the output: HEADLESS-2 rim only" g_glide2 1280 'clay(px(0.3,400)) and region(4,4,1276,796,clay) == 0'
 exec 3>&-
 wait "$OPID" || bad "overlay g exit $?"
+
+echo ">>> capture latency (hide -> ack, 50 rounds per scope, rim + arrow on HEADLESS-1)"
+if python3 -I - "$DEMO" <<'PY'
+import json, statistics, subprocess, sys, time
+p = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+def send(o): p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
+def until(ev, id=None):
+    while True:
+        line = p.stdout.readline()
+        if not line: raise SystemExit("overlay exited")
+        e = json.loads(line)
+        if e.get("event") == ev and (id is None or e.get("id") == id): return e
+ready = until("ready")
+print("    ready:", json.dumps(ready, separators=(",", ":")))
+send({"cmd": "show", "output": "HEADLESS-1", "look": "rim", "arrow": {"x": 300, "y": 200}}); until("shown")
+time.sleep(0.4)
+ok = True
+n = 0
+for scope in ("cursor", "all"):
+    hide, restore = [], []
+    for i in range(50):
+        send({"cmd": "jump", "x": 300 + i * 7, "y": 200 + i * 3})
+        if i % 5 == 0: send({"cmd": "press", "x": 300 + i * 7, "y": 200 + i * 3})
+        time.sleep(0.02)
+        n += 1; t = time.perf_counter(); send({"cmd": "capture", "phase": "hide", "id": n, "scope": scope}); until("ack", n); hide.append((time.perf_counter() - t) * 1000)
+        n += 1; t = time.perf_counter(); send({"cmd": "capture", "phase": "restore", "id": n}); until("ack", n); restore.append((time.perf_counter() - t) * 1000)
+    print("    scope=%-6s hide->ack median %.2f ms, max %.2f ms | restore->ack median %.2f ms, max %.2f ms"
+          % (scope, statistics.median(hide), max(hide), statistics.median(restore), max(restore)))
+    ok = ok and max(hide) < 100
+p.stdin.close(); p.wait(timeout=5)
+sys.exit(0 if ok and p.returncode == 0 else 1)
+PY
+then ok "capture acks within 100 ms (all rounds)"; else bad "capture latency"; fi
 
 echo ">>> overlay C (unknown output is fatal)"
 SEEN=0

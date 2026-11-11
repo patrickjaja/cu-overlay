@@ -47,6 +47,20 @@ impl Pose {
     }
 }
 
+/// What a capture hide removes from the composited image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureScope {
+    /// Everything (rim or glow included) fully transparent.
+    #[default]
+    All,
+    /// Only the drawn cursor (arrow and press ring); the rim or glow stays.
+    Cursor,
+}
+
+/// The scopes `capture` accepts, advertised in `ready`.
+pub const CAPTURE_SCOPES: &[&str] = &["all", "cursor"];
+
 /// A capture command's phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,13 +84,29 @@ pub struct Show {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Show(Show),
-    Move { output: String },
-    Glide { frames: Vec<Pose>, frame_ms: f64 },
-    Jump { x: f64, y: f64 },
-    Press { x: f64, y: f64 },
+    Move {
+        output: String,
+    },
+    Glide {
+        frames: Vec<Pose>,
+        frame_ms: f64,
+    },
+    Jump {
+        x: f64,
+        y: f64,
+    },
+    Press {
+        x: f64,
+        y: f64,
+    },
     Look(Look),
     Hide,
-    Capture { phase: CapturePhase, id: u64 },
+    /// `scope` matters for `hide` only; `restore` ends any hide.
+    Capture {
+        phase: CapturePhase,
+        id: u64,
+        scope: CaptureScope,
+    },
 }
 
 #[derive(Deserialize)]
@@ -122,6 +152,8 @@ enum Raw {
     Capture {
         phase: CapturePhase,
         id: u64,
+        #[serde(default)]
+        scope: CaptureScope,
     },
 }
 
@@ -200,7 +232,7 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         },
         Raw::Look { look } => Command::Look(look),
         Raw::Hide => Command::Hide,
-        Raw::Capture { phase, id } => Command::Capture { phase, id },
+        Raw::Capture { phase, id, scope } => Command::Capture { phase, id, scope },
     })
 }
 
@@ -218,6 +250,7 @@ pub enum Event {
         alpha_modifier: bool,
         fractional_scale: bool,
         badge: bool,
+        capture_scopes: &'static [&'static str],
         outputs: Vec<OutputInfo>,
     },
     Shown {
@@ -309,7 +342,24 @@ mod tests {
             parse_command(r#"{"cmd":"capture","phase":"restore","id":7}"#).unwrap(),
             Command::Capture {
                 phase: CapturePhase::Restore,
-                id: 7
+                id: 7,
+                scope: CaptureScope::All
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"capture","phase":"hide","id":8,"scope":"cursor"}"#).unwrap(),
+            Command::Capture {
+                phase: CapturePhase::Hide,
+                id: 8,
+                scope: CaptureScope::Cursor
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"capture","phase":"hide","id":9,"scope":"all"}"#).unwrap(),
+            Command::Capture {
+                phase: CapturePhase::Hide,
+                id: 9,
+                scope: CaptureScope::All
             }
         );
         // unknown extra fields are ignored (forward compatible)
@@ -357,6 +407,8 @@ mod tests {
             r#"{"cmd":"jump","x":1e300,"y":2}"#,
             r#"{"cmd":"capture","phase":"hide"}"#,
             r#"{"cmd":"capture","phase":"peek","id":1}"#,
+            r#"{"cmd":"capture","phase":"hide","id":1,"scope":"window"}"#,
+            r#"{"cmd":"capture","phase":"hide","id":1,"scope":null}"#,
             r#"{"cmd":"capture","phase":"hide","id":-1}"#,
             r#"[1,2]"#,
         ] {
@@ -372,6 +424,7 @@ mod tests {
             alpha_modifier: true,
             fractional_scale: false,
             badge: false,
+            capture_scopes: CAPTURE_SCOPES,
             outputs: vec![OutputInfo {
                 name: "HEADLESS-1".into(),
                 x: 0,
@@ -383,7 +436,7 @@ mod tests {
         };
         assert_eq!(
             ready.line(),
-            "{\"event\":\"ready\",\"protocol\":1,\"backend\":\"layer-shell\",\"alphaModifier\":true,\"fractionalScale\":false,\"badge\":false,\"outputs\":[{\"name\":\"HEADLESS-1\",\"x\":0,\"y\":0,\"width\":1280,\"height\":800,\"scale\":1.0}]}\n"
+            "{\"event\":\"ready\",\"protocol\":1,\"backend\":\"layer-shell\",\"alphaModifier\":true,\"fractionalScale\":false,\"badge\":false,\"captureScopes\":[\"all\",\"cursor\"],\"outputs\":[{\"name\":\"HEADLESS-1\",\"x\":0,\"y\":0,\"width\":1280,\"height\":800,\"scale\":1.0}]}\n"
         );
         assert_eq!(Event::Hidden.line(), "{\"event\":\"hidden\"}\n");
         assert_eq!(
