@@ -148,7 +148,39 @@ impl Controller {
     }
 
     /// Apply one command.
+    ///
+    /// Arrow points (`jump`, `press`, glide frames, a `show` arrow) that lie
+    /// off the shown output while the drawn cursor is on (shown, rim look)
+    /// are accepted and kept, but not drawn; one non-fatal
+    /// `arrow outside output <name>` error is emitted per command.
     pub fn handle(&mut self, cmd: Command, now: Instant, outputs: &[OutputInfo]) -> Vec<Action> {
+        let points: Vec<(f64, f64)> = match &cmd {
+            Command::Jump { x, y } | Command::Press { x, y } => vec![(*x, *y)],
+            Command::Glide { frames, .. } => frames.iter().map(|f| (f.x, f.y)).collect(),
+            Command::Show(s) => s.arrow.into_iter().collect(),
+            _ => Vec::new(),
+        };
+        let mut actions = self.apply(cmd, now, outputs);
+        if actions.iter().any(|a| matches!(a, Action::Exit(_))) {
+            return actions;
+        }
+        if self.visible()
+            && self.look == Look::Rim
+            && let Some(out) = self
+                .output
+                .as_deref()
+                .and_then(|n| outputs.iter().find(|o| o.name == n))
+            && points.iter().any(|&(x, y)| !out.contains(x, y))
+        {
+            actions.push(Action::Emit(Event::error(
+                format!("arrow outside output {}", out.name),
+                false,
+            )));
+        }
+        actions
+    }
+
+    fn apply(&mut self, cmd: Command, now: Instant, outputs: &[OutputInfo]) -> Vec<Action> {
         let known = |name: &str| outputs.iter().any(|o| o.name == name);
         match cmd {
             Command::Show(s) => {
@@ -465,6 +497,72 @@ mod tests {
             &a[0],
             Action::Emit(Event::Error { fatal: true, .. })
         ));
+    }
+
+    fn errors(a: &[Action]) -> Vec<String> {
+        a.iter()
+            .filter_map(|a| match a {
+                Action::Emit(Event::Error { message, fatal }) => {
+                    assert!(!fatal);
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arrow_off_the_shown_output_is_kept_and_reported_once() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim"}"#),
+            t0,
+            &outs(),
+        );
+        // B starts at x = 1280
+        let a = c.handle(cmd(r#"{"cmd":"jump","x":1500,"y":100}"#), t0, &outs());
+        assert_eq!(errors(&a), vec!["arrow outside output A".to_string()]);
+        assert_eq!(
+            c.scene(t0).unwrap().arrow.unwrap().pose,
+            Pose::at(1500.0, 100.0)
+        );
+        let a = c.handle(cmd(r#"{"cmd":"press","x":1500,"y":100}"#), t0, &outs());
+        assert_eq!(errors(&a).len(), 1);
+        // a glide leaving the output: one error for the whole command
+        let a = c.handle(
+            cmd(r#"{"cmd":"glide","frames":[[1200,100],[1270,100],[1300,100],[1400,100]]}"#),
+            t0,
+            &outs(),
+        );
+        assert_eq!(errors(&a).len(), 1);
+        // in bounds: no error
+        let a = c.handle(cmd(r#"{"cmd":"jump","x":1279,"y":799}"#), t0, &outs());
+        assert!(errors(&a).is_empty());
+        // glow look or hidden: nothing to report
+        c.handle(cmd(r#"{"cmd":"look","look":"glow"}"#), t0, &outs());
+        assert!(errors(&c.handle(cmd(r#"{"cmd":"jump","x":1500,"y":1}"#), t0, &outs())).is_empty());
+    }
+
+    #[test]
+    fn move_keeps_the_arrow_pose_for_the_new_output() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim"}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(cmd(r#"{"cmd":"jump","x":1680,"y":300}"#), t0, &outs());
+        let a = c.handle(cmd(r#"{"cmd":"move","output":"B"}"#), t0, &outs());
+        assert_eq!(a, vec![Action::Create("B".into()), Action::Redraw]);
+        let s = c.scene(ms(t0, 400)).unwrap();
+        assert_eq!(s.arrow.unwrap().pose, Pose::at(1680.0, 300.0));
+        assert_eq!(s.opacity, 1.0);
+        // and the point is on B, so no error on the next in-bounds command
+        assert!(
+            errors(&c.handle(cmd(r#"{"cmd":"jump","x":1700,"y":300}"#), t0, &outs())).is_empty()
+        );
     }
 
     #[test]

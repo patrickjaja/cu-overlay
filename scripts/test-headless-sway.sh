@@ -178,11 +178,12 @@ assert_shot "glow fades toward the middle" glow 1280 'black(px(640,400)) and px(
 assert_shot "no arrow in the glow look" glow 1280 'not clay(px(312,212))'
 
 # the glow pulses: the edge brightness changes over a second
-shot pulse1 HEADLESS-1; sleep 1.0; shot pulse2 HEADLESS-1
+# four shots 0.5 s apart cover a whole 2 s period, whatever the phase
+for i in 1 2 3 4; do shot "pulse$i" HEADLESS-1; sleep 0.5; done
 if python3 -I -c "
 from PIL import Image
-a=Image.open('$EVID/pulse1.png').getpixel((3,400))[0]; b=Image.open('$EVID/pulse2.png').getpixel((3,400))[0]
-import sys; print('    edge red', a, b); sys.exit(0 if abs(a-b) >= 8 else 1)"; then ok "glow pulses (alpha modifier)"; else bad "glow did not pulse"; fi
+v=[Image.open('$EVID/pulse%d.png' % i).getpixel((3,400))[0] for i in (1,2,3,4)]
+import sys; print('    edge red', v); sys.exit(0 if max(v) - min(v) >= 8 else 1)"; then ok "glow pulses (alpha modifier)"; else bad "glow did not pulse"; fi
 
 # second output at scale 1.5 with an x offset
 send '{"cmd":"look","look":"rim"}'
@@ -395,6 +396,62 @@ else
 fi
 exec 3>&-
 wait "$OPID" || bad "overlay f exit $?"
+
+echo ">>> overlay G (the arrow never leaves the shown output)"
+SEEN=0
+start_overlay g
+wait_event '"event":"ready"' || bad "ready g"
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","arrow":{"x":300,"y":200}}'
+wait_event '"event":"shown","output":"HEADLESS-1"' || bad "shown g"
+# the live bug: shown on HEADLESS-1, jump + press at a point on HEADLESS-2
+send '{"cmd":"jump","x":1680,"y":300}'
+wait_event '"event":"error","message":"arrow outside output HEADLESS-1","fatal":false' && ok "jump off the output: non-fatal error" || bad "jump off-output error"
+send '{"cmd":"press","x":1680,"y":300}'
+wait_event '"event":"error","message":"arrow outside output HEADLESS-1","fatal":false' && ok "press off the output: non-fatal error" || bad "press off-output error"
+sleep 0.15
+shot g_off2 HEADLESS-2; shot g_off1 HEADLESS-1
+assert_shot "nothing drawn on HEADLESS-2 for an off-output jump + press" g_off2 1280 'all_black()'
+assert_shot "HEADLESS-1 keeps its rim, no arrow or ring anywhere on it" g_off1 1280 'clay(px(0,400)) and clay(px(1279,400)) and region(4,4,1276,796,reddish) == 0'
+kill -0 "$OPID" 2>/dev/null && ok "alive after off-output commands" || bad "died on off-output commands"
+# move to the output the pose is on: drawn there without resending it
+sleep 1.2
+send '{"cmd":"move","output":"HEADLESS-2"}'
+wait_event '"event":"shown","output":"HEADLESS-2"' || bad "shown g2"
+sleep 0.4
+shot g_moved2 HEADLESS-2; shot g_moved1 HEADLESS-1
+assert_shot "after move: rim and the kept arrow (1680,300 = local 400,300) on HEADLESS-2" g_moved2 1280 'clay(px(0.3,400)) and clay(px(412,312)) and region(396,295,404,303,white) > 4'
+assert_shot "after move: nothing left on HEADLESS-1" g_moved1 1280 'all_black()'
+# straddling the shared edge from HEADLESS-1: arrow box and ring cut at x = 1280
+send '{"cmd":"move","output":"HEADLESS-1"}'
+wait_event '"event":"shown","output":"HEADLESS-1"' || bad "shown g3"
+send '{"cmd":"press","x":1276,"y":400}'
+sleep 0.05
+shot g_edge2 HEADLESS-2; shot g_edge1 HEADLESS-1
+assert_shot "straddling from HEADLESS-1: no pixel of ours on HEADLESS-2" g_edge2 1280 'all_black()'
+assert_shot "straddling from HEADLESS-1: the arrow tip and the ring's left half on HEADLESS-1" g_edge1 1280 'region(1270,396,1280,412,clay) > 3 and region(1200,340,1266,460,lambda p: p[0] - p[2] > 8) > 10'
+# straddling from HEADLESS-2 (scale 1.5) toward HEADLESS-1
+sleep 1.2
+send '{"cmd":"move","output":"HEADLESS-2"}'
+wait_event '"event":"shown","output":"HEADLESS-2"' || bad "shown g4"
+send '{"cmd":"press","x":1283,"y":300}'
+sleep 0.2
+shot g_edge1b HEADLESS-1; shot g_edge2b HEADLESS-2
+assert_shot "straddling from HEADLESS-2: no pixel of ours on HEADLESS-1" g_edge1b 1280 'all_black()'
+assert_shot "straddling from HEADLESS-2: the arrow at local (3,300) on HEADLESS-2" g_edge2b 1280 'region(0,295,30,330,clay) > 5'
+# a glide that leaves the output: one error, no arrow drawn once it is off
+sleep 1.2
+FR2="$(python3 -I -c "
+import json
+print(json.dumps([[1400 - i * 20, 300, 0, 0] for i in range(21)]))")"
+send "{\"cmd\":\"glide\",\"frames\":$FR2,\"frameMs\":16}"
+wait_event '"event":"error","message":"arrow outside output HEADLESS-2","fatal":false' && ok "glide leaving the output: one non-fatal error" || bad "glide off-output error"
+sleep 0.6
+[ "$(grep -c 'arrow outside output' "$OUT")" = 3 ] && ok "exactly one error per off-output command" || bad "error count $(grep -c 'arrow outside output' "$OUT")"
+shot g_glide1 HEADLESS-1; shot g_glide2 HEADLESS-2
+assert_shot "glide end off the output: nothing on HEADLESS-1" g_glide1 1280 'all_black()'
+assert_shot "glide end off the output: HEADLESS-2 rim only" g_glide2 1280 'clay(px(0.3,400)) and region(4,4,1276,796,clay) == 0'
+exec 3>&-
+wait "$OPID" || bad "overlay g exit $?"
 
 echo ">>> overlay C (unknown output is fatal)"
 SEEN=0

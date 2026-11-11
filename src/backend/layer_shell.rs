@@ -472,9 +472,12 @@ impl LayerShell {
         Ok(changed)
     }
 
-    /// Update one subsurface: `draw` is `None` to unmap it, else the logical
-    /// local position of its anchor point, the anchor's offset inside the
-    /// surface, the content key and a painter.
+    /// Update one subsurface: `draw` is `None` to unmap it, else the
+    /// output-local logical position of its anchor point (hotspot or ring
+    /// centre), the anchor's offset inside the full box, the content key and
+    /// a painter `(buf, w, h, scale, anchor_x, anchor_y)`. The box is clipped
+    /// to the output ([`geom::sub_box`]): a point off the output unmaps the
+    /// subsurface, a box over the edge gets a smaller buffer cut at the edge.
     #[allow(clippy::type_complexity)]
     fn present_sub(
         &mut self,
@@ -485,7 +488,7 @@ impl LayerShell {
             (f64, f64),
             i32,
             [i32; 5],
-            &dyn Fn(&mut [u8], usize, f32, f32, f32),
+            &dyn Fn(&mut [u8], usize, usize, f32, f32, f32),
         )>,
     ) -> Result<bool, String> {
         let has_alpha = self.st.g.alpha.is_some();
@@ -499,8 +502,12 @@ impl LayerShell {
         let Some(surf) = st.surf.as_mut() else {
             return Ok(false);
         };
+        let out_size = surf.size;
+        let placed = draw.and_then(|(local, anchor, k, paint)| {
+            geom::sub_box(local, anchor, size, out_size).map(|b| (b, k, paint))
+        });
         let sub = if ring { &mut surf.ring } else { &mut surf.cur };
-        let Some(((lx, ly), anchor, k, paint)) = draw else {
+        let Some((bx, k, paint)) = placed else {
             if sub.key.is_some() {
                 sub.surf.attach(None, 0, 0);
                 sub.surf.commit();
@@ -509,31 +516,34 @@ impl LayerShell {
             }
             return Ok(false);
         };
-        let (px, fx) = geom::place(lx, anchor);
-        let (py, fy) = geom::place(ly, anchor);
+        let q = |v: f64| (v * 32.0).round() as i32;
         let baked = if has_alpha { 1.0 } else { opacity };
         let key = SubKey([
-            (fx * 32.0).round() as i32,
-            (fy * 32.0).round() as i32,
+            q(bx.anchor_x),
+            q(bx.anchor_y),
             k[0],
             k[1],
             k[2],
             k[3],
-            k[4],
+            (bx.w << 16) | bx.h,
             ((baked * 255.0).round() as i32) << 12 | s120 as i32,
         ]);
         let mut changed = false;
         if sub.key != Some(key) {
-            let pxs = geom::to_px(size, s120);
-            let id = st.take_buf(role, pxs, pxs, &self.qh)?;
+            let (bw, bh) = (
+                geom::to_px(bx.w, s120).max(1),
+                geom::to_px(bx.h, s120).max(1),
+            );
+            let id = st.take_buf(role, bw, bh, &self.qh)?;
             let b = st.bufs.get_mut(&id).expect("buffer just taken");
             let scale = s120 as f32 / 120.0;
             paint(
                 b.pixels(),
-                pxs as usize,
+                bw as usize,
+                bh as usize,
                 scale,
-                anchor as f32 + (fx * 32.0).round() as f32 / 32.0,
-                anchor as f32 + (fy * 32.0).round() as f32 / 32.0,
+                q(bx.anchor_x) as f32 / 32.0,
+                q(bx.anchor_y) as f32 / 32.0,
             );
             if baked < 1.0 {
                 render::apply_opacity(b.pixels(), baked as f32);
@@ -543,9 +553,9 @@ impl LayerShell {
             let surf = st.surf.as_mut().expect("surface checked above");
             let sub = if ring { &mut surf.ring } else { &mut surf.cur };
             sub.surf.attach(Some(&wl), 0, 0);
-            sub.surf.damage_buffer(0, 0, pxs, pxs);
+            sub.surf.damage_buffer(0, 0, bw, bh);
             match &sub.vp {
-                Some(vp) => vp.set_destination(size, size),
+                Some(vp) => vp.set_destination(bx.w, bx.h),
                 None => sub.surf.set_buffer_scale((s120 / 120) as i32),
             }
             sub.key = Some(key);
@@ -565,9 +575,9 @@ impl LayerShell {
         if changed {
             sub.surf.commit();
         }
-        if sub.pos != Some((px, py)) {
-            sub.sub.set_position(px, py);
-            sub.pos = Some((px, py));
+        if sub.pos != Some((bx.x, bx.y)) {
+            sub.sub.set_position(bx.x, bx.y);
+            sub.pos = Some((bx.x, bx.y));
             changed = true;
         }
         Ok(changed)
@@ -598,8 +608,8 @@ impl LayerShell {
             (out.to_local(p.x, p.y), f, key)
         });
         let ring_paint = ring.map(|(_, f, _)| {
-            move |buf: &mut [u8], n: usize, scale: f32, cx: f32, cy: f32| {
-                render::draw_ring(buf, n, n, scale, cx, cy, &f, 1.0)
+            move |buf: &mut [u8], w: usize, h: usize, scale: f32, cx: f32, cy: f32| {
+                render::draw_ring(buf, w, h, scale, cx, cy, &f, 1.0)
             }
         });
         changed |= self.present_sub(
@@ -611,7 +621,7 @@ impl LayerShell {
                     pos,
                     RING_HALF,
                     key,
-                    p as &dyn Fn(&mut [u8], usize, f32, f32, f32),
+                    p as &dyn Fn(&mut [u8], usize, usize, f32, f32, f32),
                 )
             }),
         )?;
@@ -627,7 +637,7 @@ impl LayerShell {
             (out.to_local(a.pose.x, a.pose.y), a, key)
         });
         let arrow_paint = arrow.map(|(_, a, _)| {
-            move |buf: &mut [u8], n: usize, scale: f32, hx: f32, hy: f32| {
+            move |buf: &mut [u8], w: usize, h: usize, scale: f32, hx: f32, hy: f32| {
                 let p = ArrowParams {
                     hot_x: hx,
                     hot_y: hy,
@@ -635,7 +645,7 @@ impl LayerShell {
                     lift: a.pose.lift as f32,
                     press_scale: a.scale as f32,
                 };
-                render::draw_arrow(buf, n, n, scale, &p, 1.0)
+                render::draw_arrow(buf, w, h, scale, &p, 1.0)
             }
         });
         changed |= self.present_sub(
@@ -647,7 +657,7 @@ impl LayerShell {
                     pos,
                     CURSOR_HOT,
                     key,
-                    p as &dyn Fn(&mut [u8], usize, f32, f32, f32),
+                    p as &dyn Fn(&mut [u8], usize, usize, f32, f32, f32),
                 )
             }),
         )?;
