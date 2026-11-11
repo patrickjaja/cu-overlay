@@ -347,6 +347,18 @@ assert_shot "nothing left (no alpha modifier)" b_hidden 1280 'all_black()'
 exec 3>&-
 wait "$OPID" || bad "overlay b exit $?"
 
+echo ">>> overlay E (no viewporter: integer buffer scale on the 1.5 output)"
+SEEN=0
+start_overlay e CU_OVERLAY_DISABLE=viewporter
+wait_event '"event":"ready".*"fractionalScale":false' && ok "ready without viewporter / fractional scale" || bad "ready e"
+send '{"cmd":"show","output":"HEADLESS-2","look":"rim","arrow":{"x":1680,"y":300}}'
+wait_event '"event":"shown","output":"HEADLESS-2","scale":2\.0' && ok "shown at integer scale 2 (buffer scale)" || bad "shown e"
+sleep 0.4
+shot e_rim HEADLESS-2
+assert_shot "rim and arrow without viewporter" e_rim 1280 'clay(px(0.3,400)) and clay(px(1279.5,400)) and clay(px(412,312)) and region(396,295,404,303,white) > 4'
+exec 3>&-
+wait "$OPID" || bad "overlay e exit $?"
+
 echo ">>> overlay C (unknown output is fatal)"
 SEEN=0
 start_overlay c

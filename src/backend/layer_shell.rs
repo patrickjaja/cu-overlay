@@ -199,6 +199,9 @@ struct St {
     bufs: HashMap<u32, Buf>,
     next_buf: u32,
     events: Vec<BackendEvent>,
+    /// Redraws of the main, ring and arrow buffers, and main commits
+    /// (printed to stderr at exit with `CU_OVERLAY_DEBUG=1`).
+    stats: [u64; 4],
 }
 
 pub struct LayerShell {
@@ -365,6 +368,7 @@ impl LayerShell {
             bufs: HashMap::new(),
             next_buf: 1,
             events: Vec::new(),
+            stats: [0; 4],
         };
         let registry = globals.registry().clone();
         globals.contents().with_list(|list| {
@@ -449,6 +453,7 @@ impl LayerShell {
                 None => s.main.set_buffer_scale((s120 / 120) as i32),
             }
             s.main_key = Some((key, s120));
+            st.stats[0] += 1;
             changed = true;
         }
         let s = st.surf.as_mut().expect("surface checked above");
@@ -544,6 +549,7 @@ impl LayerShell {
                 None => sub.surf.set_buffer_scale((s120 / 120) as i32),
             }
             sub.key = Some(key);
+            st.stats[if ring { 1 } else { 2 }] += 1;
             changed = true;
         }
         let surf = st.surf.as_mut().expect("surface checked above");
@@ -654,6 +660,7 @@ impl LayerShell {
         }
         if changed {
             s.main.commit();
+            self.st.stats[3] += 1;
         }
         Ok(())
     }
@@ -678,6 +685,15 @@ fn bind_output(
         int_scale: 1,
         ..Output::default()
     });
+}
+
+impl Drop for LayerShell {
+    fn drop(&mut self) {
+        if std::env::var_os("CU_OVERLAY_DEBUG").is_some_and(|v| v != "0") {
+            let [m, r, c, k] = self.st.stats;
+            eprintln!("cu-overlay: redraws main={m} ring={r} arrow={c}, commits={k}");
+        }
+    }
 }
 
 impl Backend for LayerShell {

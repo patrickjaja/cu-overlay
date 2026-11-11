@@ -7,9 +7,11 @@
 //! Geometry follows upstream's cu-glow page (Claude Desktop 5.1231): sizes
 //! are CSS (logical) pixels and get multiplied by the buffer scale.
 
+use std::cell::RefCell;
+
 use tiny_skia::{
-    Color, FillRule, GradientStop, IntSize, LineJoin, Mask, Paint, PathBuilder, PixmapMut, Point,
-    RadialGradient, Rect, SpreadMode, Stroke, Transform,
+    Color, FillRule, GradientStop, LineJoin, Mask, Paint, PathBuilder, PixmapMut, Point,
+    RadialGradient, SpreadMode, Stroke, Transform,
 };
 
 use crate::anim::{PressFrame, RING_BORDER, RING_RADIUS};
@@ -223,7 +225,6 @@ fn boxes_for_gauss(sigma: f32) -> [usize; 3] {
 
 /// One box blur pass of radius `r` along rows (`horizontal`) or columns,
 /// limited to the rectangle `x0..x1, y0..y1`.
-#[allow(clippy::too_many_arguments)]
 fn box_pass(
     src: &[u8],
     dst: &mut [u8],
@@ -260,62 +261,101 @@ fn box_pass(
     }
 }
 
-/// Gaussian-ish blur of an 8-bit mask (three box passes each way), limited
-/// to the bounding box of its non-zero pixels grown by 3 sigma.
-fn blur_mask(data: &mut [u8], w: usize, h: usize, sigma: f32) {
-    if sigma < 0.3 {
-        return;
-    }
-    let (mut x0, mut x1, mut y0, mut y1) = (w, 0, h, 0);
-    for y in 0..h {
-        for x in 0..w {
-            if data[y * w + x] != 0 {
-                x0 = x0.min(x);
-                x1 = x1.max(x + 1);
-                y0 = y0.min(y);
-                y1 = y1.max(y + 1);
-            }
+/// Reusable per-thread memory for [`draw_arrow`]: the silhouette mask and
+/// two blur planes, so a glide does not allocate per frame.
+struct Scratch {
+    sil: Option<Mask>,
+    a: Vec<u8>,
+    b: Vec<u8>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = const {
+        RefCell::new(Scratch {
+            sil: None,
+            a: Vec::new(),
+            b: Vec::new(),
+        })
+    };
+}
+
+impl Scratch {
+    fn ensure(&mut self, w: usize, h: usize) -> bool {
+        let fits = self
+            .sil
+            .as_ref()
+            .is_some_and(|m| m.width() as usize == w && m.height() as usize == h);
+        if !fits {
+            self.sil = Mask::new(w as u32, h as u32);
+            self.a = vec![0; w * h];
+            self.b = vec![0; w * h];
         }
-    }
-    if x0 >= x1 {
-        return;
-    }
-    let g = (3.0 * sigma).ceil() as usize + 1;
-    let rect = (
-        x0.saturating_sub(g),
-        (x1 + g).min(w),
-        y0.saturating_sub(g),
-        (y1 + g).min(h),
-    );
-    let mut tmp = data.to_vec();
-    for b in boxes_for_gauss(sigma) {
-        let r = (b - 1) / 2;
-        box_pass(data, &mut tmp, w, r, true, rect);
-        box_pass(&tmp, data, w, r, false, rect);
+        self.sil.is_some()
     }
 }
 
-/// Draw a drop shadow of `silhouette` (blurred by `sigma` px, moved down by
-/// `dy` px) in black at `alpha`.
-fn drop_shadow(pm: &mut PixmapMut, silhouette: &Mask, sigma: f32, dy: f32, alpha: f32) {
-    let (w, h) = (pm.width() as usize, pm.height() as usize);
-    let mut data = vec![0u8; w * h];
+/// `x0, x1, y0, y1` (end exclusive).
+type Region = (usize, usize, usize, usize);
+
+/// Composite a drop shadow of the silhouette `sil` (moved down by `dy` px,
+/// blurred by `sigma` px) in black at `alpha` onto `dst`
+/// (premultiplied source-over). Only the region around `bbox` is touched.
+#[allow(clippy::too_many_arguments)]
+fn drop_shadow(
+    dst: &mut [u8],
+    (w, h): (usize, usize),
+    sil: &[u8],
+    bbox: Region,
+    (sigma, dy, alpha): (f32, f32, f32),
+    a: &mut [u8],
+    b: &mut [u8],
+) {
     let shift = dy.round().max(0.0) as usize;
-    for y in shift..h {
-        data[y * w..y * w + w]
-            .copy_from_slice(&silhouette.data()[(y - shift) * w..(y - shift) * w + w]);
+    let blur = sigma >= 0.3;
+    let g = if blur {
+        (3.0 * sigma).ceil() as usize + 1
+    } else {
+        0
+    };
+    let rect = (
+        bbox.0.saturating_sub(g),
+        (bbox.1 + g).min(w),
+        (bbox.2 + shift).saturating_sub(g).min(h),
+        (bbox.3 + shift + g).min(h),
+    );
+    if rect.0 >= rect.1 || rect.2 >= rect.3 {
+        return;
     }
-    blur_mask(&mut data, w, h, sigma);
-    let Some(size) = IntSize::from_wh(w as u32, h as u32) else {
-        return;
-    };
-    let Some(mask) = Mask::from_vec(data, size) else {
-        return;
-    };
-    let mut paint = Paint::default();
-    paint.set_color(bgra(0, 0, 0, alpha));
-    if let Some(r) = Rect::from_xywh(0.0, 0.0, w as f32, h as f32) {
-        pm.fill_rect(r, &paint, Transform::identity(), Some(&mask));
+    for y in rect.2..rect.3 {
+        let row = &mut a[y * w + rect.0..y * w + rect.1];
+        if y >= shift {
+            let src = (y - shift) * w;
+            row.copy_from_slice(&sil[src + rect.0..src + rect.1]);
+        } else {
+            row.fill(0);
+        }
+    }
+    if blur {
+        for bx in boxes_for_gauss(sigma) {
+            let r = (bx - 1) / 2;
+            box_pass(a, b, w, r, true, rect);
+            box_pass(b, a, w, r, false, rect);
+        }
+    }
+    let k = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    for y in rect.2..rect.3 {
+        for x in rect.0..rect.1 {
+            let m = (a[y * w + x] as u32 * k + 127) / 255;
+            if m == 0 {
+                continue;
+            }
+            let inv = 255 - m;
+            let o = (y * w + x) * 4;
+            for c in &mut dst[o..o + 3] {
+                *c = ((*c as u32 * inv + 127) / 255) as u8;
+            }
+            dst[o + 3] = (m + (dst[o + 3] as u32 * inv + 127) / 255) as u8;
+        }
     }
 }
 
@@ -324,9 +364,6 @@ fn drop_shadow(pm: &mut PixmapMut, silhouette: &Mask, sigma: f32, dy: f32, alpha
 /// rgba(0,0,0,.25 - .08 lift)` in body units). `buf` is cleared first.
 pub fn draw_arrow(buf: &mut [u8], w: usize, h: usize, scale: f32, p: &ArrowParams, opacity: f32) {
     clear(buf);
-    let Some(mut pm) = PixmapMut::from_bytes(buf, w as u32, h as u32) else {
-        return;
-    };
     let path = arrow_path();
     let tf = arrow_transform(p, scale);
     let outline = Stroke {
@@ -339,33 +376,54 @@ pub fn draw_arrow(buf: &mut [u8], w: usize, h: usize, scale: f32, p: &ArrowParam
         line_join: LineJoin::Round,
         ..Default::default()
     };
+    let Some(white) = path.stroke(&outline, 1.0) else {
+        return;
+    };
 
-    // silhouette = the white layer (fill + 4.4 stroke)
-    if let Some(mut sil) = Mask::new(w as u32, h as u32) {
-        sil.fill_path(&path, FillRule::Winding, true, tf);
-        if let Some(stroked) = path.stroke(&outline, 1.0) {
-            sil.fill_path(&stroked, FillRule::Winding, true, tf);
-        }
-        let body_k = 2.0 * (1.0 + 0.06 * p.lift) * scale;
-        let lift = p.lift.clamp(0.0, 1.0);
-        // drop-shadow's blur length is the Gaussian's standard deviation
-        // (SVG feGaussianBlur stdDeviation), in body units
-        drop_shadow(
-            &mut pm,
-            &sil,
-            (2.5 + 6.0 * lift) * body_k,
-            (1.5 + 4.5 * lift) * body_k,
-            0.25 - 0.08 * lift,
+    // shadows of the silhouette (the white layer: fill + 4.4 stroke)
+    if let Some(bounds) = white.bounds().transform(tf) {
+        let bbox = (
+            (bounds.left().floor() as isize - 2).clamp(0, w as isize) as usize,
+            (bounds.right().ceil() as isize + 2).clamp(0, w as isize) as usize,
+            (bounds.top().floor() as isize - 2).clamp(0, h as isize) as usize,
+            (bounds.bottom().ceil() as isize + 2).clamp(0, h as isize) as usize,
         );
-        drop_shadow(&mut pm, &sil, 0.6 * body_k, 0.5 * body_k, 0.2);
+        SCRATCH.with_borrow_mut(|sc| {
+            if !sc.ensure(w, h) {
+                return;
+            }
+            let Scratch { sil, a, b } = sc;
+            let sil = sil.as_mut().expect("ensured");
+            sil.clear();
+            sil.fill_path(&path, FillRule::Winding, true, tf);
+            sil.fill_path(&white, FillRule::Winding, true, tf);
+            let body_k = 2.0 * (1.0 + 0.06 * p.lift) * scale;
+            let lift = p.lift.clamp(0.0, 1.0);
+            // drop-shadow's blur length is the Gaussian's standard deviation
+            // (SVG feGaussianBlur stdDeviation), in body units
+            let shadows = [
+                (
+                    (2.5 + 6.0 * lift) * body_k,
+                    (1.5 + 4.5 * lift) * body_k,
+                    0.25 - 0.08 * lift,
+                ),
+                (0.6 * body_k, 0.5 * body_k, 0.2),
+            ];
+            for sh in shadows {
+                drop_shadow(buf, (w, h), sil.data(), bbox, sh, a, b);
+            }
+        });
     }
 
+    let Some(mut pm) = PixmapMut::from_bytes(buf, w as u32, h as u32) else {
+        return;
+    };
     let mut paint = Paint {
         anti_alias: true,
         ..Default::default()
     };
     paint.set_color(bgra(255, 255, 255, 1.0));
-    pm.stroke_path(&path, &paint, &outline, tf, None);
+    pm.fill_path(&white, &paint, FillRule::Winding, tf, None);
     pm.fill_path(&path, &paint, FillRule::Winding, tf, None);
     paint.set_color(bgra(CLAY.0, CLAY.1, CLAY.2, 1.0));
     pm.stroke_path(&path, &paint, &body, tf, None);
