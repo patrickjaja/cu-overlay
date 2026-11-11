@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo clippy (renderer core only)
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
+  build:
+    name: build + test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # rust-lld (the musl linker via .cargo/config.toml) ships with the toolchain.
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: cargo test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: cargo test (renderer core only)
+        run: cargo test --locked --no-default-features --target ${{ matrix.target }}
+
+      - name: Assert fully static binary
+        run: |
+          BIN="target/${{ matrix.target }}/release/cu-overlay-demo"
+          file "$BIN"
+          if ! file "$BIN" | grep -qE "statically linked|static-pie linked"; then
+            echo "FAIL: $BIN is not statically linked" >&2
+            exit 1
+          fi
+          LDD_OUT="$(ldd "$BIN" 2>&1 || true)"
+          echo "$LDD_OUT"
+          if ! echo "$LDD_OUT" | grep -qi "not a dynamic executable\|statically linked"; then
+            echo "FAIL: ldd reports $BIN is dynamically linked" >&2
+            exit 1
+          fi
+          ls -l "$BIN"
+
+  headless-sway:
+    name: headless sway end-to-end
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-x86_64-unknown-linux-musl
+
+      - name: Install sway, foot, PIL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends sway foot python3-pil
+
+      - name: cargo build (release)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      # The screenshots come from the bridge the overlay ships in.
+      - name: Build wlroots-bridge (screenshot tool)
+        run: |
+          git clone --filter=blob:none https://github.com/patrickjaja/wlroots-bridge "$RUNNER_TEMP/wlroots-bridge"
+          cargo build --release --locked --manifest-path "$RUNNER_TEMP/wlroots-bridge/Cargo.toml" \
+            --target x86_64-unknown-linux-musl --target-dir "$RUNNER_TEMP/wb-target"
+          echo "WLROOTS_BRIDGE_BIN=$RUNNER_TEMP/wb-target/x86_64-unknown-linux-musl/release/wlroots-bridge" >> "$GITHUB_ENV"
+
+      - name: Run the headless sway test
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: scripts/test-headless-sway.sh --cpu
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: headless-sway-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: ignore
