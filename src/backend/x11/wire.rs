@@ -392,7 +392,9 @@ impl Wire for XConn {
                 4 * 64,
             )?
             .map(|v| {
-                v.chunks_exact(16)
+                v.as_chunks::<16>()
+                    .0
+                    .iter()
                     .map(|c| {
                         let n = |i: usize| {
                             u32::from_ne_bytes(c[i..i + 4].try_into().expect("4 bytes")) as i32
