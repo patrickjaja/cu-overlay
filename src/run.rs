@@ -16,9 +16,9 @@ use crate::sys::{self, Parent, ReadResult};
 
 /// Parent check interval (as in cu-abort-watch).
 const PARENT_CHECK: Duration = Duration::from_millis(500);
-/// Glow pulse redraw interval when nothing else animates (alpha multiplier
-/// only, no buffer redraw).
-const PULSE_INTERVAL: Duration = Duration::from_millis(33);
+/// Glow pulse redraw interval on layer-shell (alpha multiplier only, no
+/// buffer redraw) and the badge dot's interval on every backend.
+pub(crate) const PULSE_INTERVAL: Duration = Duration::from_millis(33);
 /// An animation whose frame callbacks stall (output off, surface occluded)
 /// still advances at this rate, so its end state lands.
 const STALL_INTERVAL: Duration = Duration::from_millis(250);
@@ -81,6 +81,8 @@ struct Loop<B: Backend, W: Write> {
     exit: Option<u8>,
     /// The output list last reported (`ready` or `outputs`).
     sent_outputs: Vec<OutputInfo>,
+    /// The backend's glow pulse interval.
+    pulse_interval: Option<Duration>,
 }
 
 impl<B: Backend, W: Write> Loop<B, W> {
@@ -200,17 +202,31 @@ impl<B: Backend, W: Write> Loop<B, W> {
         }
     }
 
+    /// How often a scene that is not frame-paced is re-presented: the badge
+    /// dot at [`PULSE_INTERVAL`], the glow pulse at the backend's rate.
+    fn redraw_interval(&self, s: &Scene) -> Option<Duration> {
+        let badge = s.badge.is_some().then_some(PULSE_INTERVAL);
+        let pulse = s.pulse.and(self.pulse_interval);
+        match (badge, pulse) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     fn timeout(&self, now: Instant) -> Duration {
         let mut d = PARENT_CHECK;
         let mut at = |t: Instant| d = d.min(t.saturating_duration_since(now));
         if let Some(t) = self.ctl.next_deadline() {
             at(t);
         }
+        if let Some(t) = self.be.next_wakeup() {
+            at(t);
+        }
         if let Some(s) = &self.last_scene
             && self.be.ready_to_draw()
         {
-            if s.pulse.is_some() || s.badge.is_some() {
-                at(self.last_present + PULSE_INTERVAL);
+            if let Some(i) = self.redraw_interval(s) {
+                at(self.last_present + i);
             }
             if s.animating {
                 at(self.last_present + STALL_INTERVAL);
@@ -238,7 +254,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
     let now = Instant::now();
     let caps = backend.caps();
     let mut l = Loop {
-        ctl: Controller::new(caps.alpha_modifier, now),
+        ctl: Controller::new(caps.alpha_modifier, now).with_pulse(caps.pulse_interval.is_some()),
         be: backend,
         out: output,
         pending: HashMap::new(),
@@ -249,6 +265,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         last_scene: None,
         exit: None,
         sent_outputs: Vec::new(),
+        pulse_interval: caps.pulse_interval,
     };
     let ready = Event::Ready {
         protocol: PROTOCOL,
@@ -277,7 +294,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         // frame-paced animation, pulse and stall timers
         if let Some(s) = &l.last_scene {
             let since = now.saturating_duration_since(l.last_present);
-            if ((s.pulse.is_some() || s.badge.is_some()) && since >= PULSE_INTERVAL)
+            if l.redraw_interval(s).is_some_and(|i| since >= i)
                 || (s.animating && since >= STALL_INTERVAL)
             {
                 l.dirty = true;
@@ -341,13 +358,76 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
     ExitCode::from(l.exit.unwrap_or(0))
 }
 
-/// Connect the layer-shell backend and [`run_with`] it. When there is no
-/// Wayland display or no layer-shell, emits a fatal `error` event and
-/// returns exit code 2 without creating anything.
-#[cfg(feature = "layer-shell")]
+/// Pick the backend, see [`run`]. `CU_OVERLAY_BACKEND` = `layer-shell` or
+/// `x11` forces one (an explicit `x11` also skips the XWayland and
+/// compositing-manager checks, for tests on Xvfb); unset or `auto` tries
+/// them in order.
+pub const BACKEND_ENV: &str = "CU_OVERLAY_BACKEND";
+
+// moved once into run_with, never stored
+#[cfg(any(feature = "layer-shell", feature = "x11"))]
+#[allow(clippy::large_enum_variant)]
+enum Picked {
+    #[cfg(feature = "layer-shell")]
+    LayerShell(crate::backend::layer_shell::LayerShell),
+    #[cfg(feature = "x11")]
+    X11(crate::backend::x11::X11),
+}
+
+#[cfg(any(feature = "layer-shell", feature = "x11"))]
+fn pick() -> Result<Picked, String> {
+    let want = std::env::var(BACKEND_ENV).unwrap_or_default();
+    let want = want.trim();
+    let auto = want.is_empty() || want == "auto";
+    if !auto && want != "layer-shell" && want != "x11" {
+        return Err(format!(
+            "{BACKEND_ENV}={want}: expected layer-shell, x11 or auto"
+        ));
+    }
+    let mut errors: Vec<String> = Vec::new();
+    if auto || want == "layer-shell" {
+        #[cfg(feature = "layer-shell")]
+        match crate::backend::layer_shell::LayerShell::connect() {
+            Ok(be) => return Ok(Picked::LayerShell(be)),
+            Err(e) => errors.push(e),
+        }
+        #[cfg(not(feature = "layer-shell"))]
+        if !auto {
+            errors.push("built without the layer-shell backend".into());
+        }
+    }
+    if auto || want == "x11" {
+        #[cfg(feature = "x11")]
+        {
+            use crate::backend::x11::{Options, X11};
+            match X11::connect(Options::from_env(!auto)) {
+                Ok(be) => return Ok(Picked::X11(be)),
+                Err(e) => errors.push(e),
+            }
+        }
+        #[cfg(not(feature = "x11"))]
+        if !auto {
+            errors.push("built without the x11 backend".into());
+        }
+    }
+    Err(errors.join("; "))
+}
+
+/// Connect a backend and [`run_with`] it.
+///
+/// Backend selection (unless `CU_OVERLAY_BACKEND` forces one): the
+/// layer-shell backend when the Wayland compositor advertises
+/// `zwlr_layer_shell_v1`; else the x11 backend when `$DISPLAY` connects, the
+/// server is XWayland and a compositing manager runs (GNOME/Mutter); a real
+/// X11 session is never picked. When none fits, emits a fatal `error`
+/// naming every reason and returns exit code 2 without creating anything.
+#[cfg(any(feature = "layer-shell", feature = "x11"))]
 pub fn run<R: AsFd, W: Write>(input: R, mut output: W) -> ExitCode {
-    match crate::backend::layer_shell::LayerShell::connect() {
-        Ok(be) => run_with(be, input, output),
+    match pick() {
+        #[cfg(feature = "layer-shell")]
+        Ok(Picked::LayerShell(be)) => run_with(be, input, output),
+        #[cfg(feature = "x11")]
+        Ok(Picked::X11(be)) => run_with(be, input, output),
         Err(e) => {
             let _ = output.write_all(Event::error(e, true).line().as_bytes());
             let _ = output.flush();

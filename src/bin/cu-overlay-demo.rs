@@ -6,6 +6,15 @@
 //!   | cu-overlay-demo
 //! ```
 
+#[cfg(any(feature = "layer-shell", feature = "x11"))]
 fn main() -> std::process::ExitCode {
     cu_overlay::run(std::io::stdin(), std::io::stdout())
+}
+
+#[cfg(not(any(feature = "layer-shell", feature = "x11")))]
+fn main() -> std::process::ExitCode {
+    println!(
+        r#"{{"event":"error","message":"built without a backend (features layer-shell, x11)","fatal":true}}"#
+    );
+    std::process::ExitCode::from(2)
 }

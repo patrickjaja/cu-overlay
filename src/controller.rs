@@ -98,6 +98,8 @@ pub struct Controller {
     /// fades and the pulse run. Without it show/hide are instant and the
     /// glow is static.
     fades: bool,
+    /// The glow pulses (needs `fades`).
+    pulses: bool,
     look: Look,
     reduced_motion: bool,
     output: Option<String>,
@@ -121,6 +123,7 @@ impl Controller {
     pub fn new(fades: bool, now: Instant) -> Self {
         Self {
             fades,
+            pulses: true,
             look: Look::Glow,
             reduced_motion: false,
             output: None,
@@ -132,6 +135,13 @@ impl Controller {
             pulse_epoch: now,
             badge: None,
         }
+    }
+
+    /// Keep the glow static even with fades (a backend whose opacity
+    /// changes are costly).
+    pub fn with_pulse(mut self, on: bool) -> Self {
+        self.pulses = on;
+        self
     }
 
     pub fn output(&self) -> Option<&str> {
@@ -456,7 +466,7 @@ impl Controller {
             })
         });
         let badge_moving = badge.as_ref().is_some_and(|b| badge::moving(b.ms));
-        let pulse = (self.look == Look::Glow && !self.reduced_motion && self.fades)
+        let pulse = (self.look == Look::Glow && !self.reduced_motion && self.fades && self.pulses)
             .then(|| anim::pulse(ms_since(now, self.pulse_epoch)));
         Some(Scene {
             look: self.look,
@@ -553,6 +563,17 @@ mod tests {
         assert_eq!(s.pulse, None, "static glow without alpha modifier");
         assert!(!s.animating);
         assert_eq!(c.handle(Command::Hide, t0, &outs()), vec![Action::Destroy]);
+    }
+
+    #[test]
+    fn a_backend_can_keep_the_glow_static_with_fades() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0).with_pulse(false);
+        c.handle(cmd(r#"{"cmd":"show","output":"A"}"#), t0, &outs());
+        assert!(c.scene(t0).unwrap().animating, "the fade still runs");
+        let s = c.scene(ms(t0, 1000)).unwrap();
+        assert_eq!((s.pulse, s.opacity), (None, 1.0), "static glow, faded in");
+        assert!(!s.animating);
     }
 
     #[test]

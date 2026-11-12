@@ -40,6 +40,12 @@ jobs:
       - name: cargo clippy (renderer core only)
         run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
 
+      - name: cargo clippy (both backends)
+        run: cargo clippy --all-targets --locked --features x11 -- -D warnings
+
+      - name: cargo clippy (x11 backend only)
+        run: cargo clippy --all-targets --locked --no-default-features --features x11 -- -D warnings
+
   build:
     name: build + test (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
@@ -71,6 +77,13 @@ jobs:
 
       - name: cargo test (renderer core only)
         run: cargo test --locked --no-default-features --target ${{ matrix.target }}
+
+      - name: cargo test (both backends)
+        run: cargo test --locked --features x11 --target ${{ matrix.target }}
+
+      # last, so the static check below sees the demo with both backends
+      - name: cargo build (release, both backends)
+        run: cargo build --release --locked --features x11 --target ${{ matrix.target }}
 
       - name: Assert fully static binary
         run: |
@@ -128,6 +141,43 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: headless-sway-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: ignore
+          retention-days: 14
+
+  xvfb:
+    name: x11 backend on Xvfb end-to-end
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: xvfb-x86_64-unknown-linux-musl
+
+      - name: Install Xvfb, X tools, picom, ImageMagick, PIL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb x11-utils x11-xserver-utils \
+            xdotool picom imagemagick python3-pil
+
+      - name: cargo build (release, both backends)
+        run: cargo build --release --locked --features x11 --target x86_64-unknown-linux-musl
+
+      - name: Run the Xvfb test
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/evidence
+        run: scripts/test-xvfb.sh
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xvfb-evidence
           path: ${{ runner.temp }}/evidence
           if-no-files-found: ignore
           retention-days: 14

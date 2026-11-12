@@ -9,8 +9,9 @@
 //! - [`protocol`]: the JSON-lines wire protocol (stdin commands, stdout
 //!   events).
 //! - [`controller`]: the protocol state machine, backend-independent.
-//! - [`backend`]: the [`backend::Backend`] seam and, with the `layer-shell`
-//!   feature, the Wayland layer-shell backend.
+//! - [`backend`]: the [`backend::Backend`] seam, the Wayland layer-shell
+//!   backend (`layer-shell` feature) and the XWayland backend for
+//!   compositors without layer-shell (`x11` feature).
 //! - [`run()`]: the run loop a bridge's `overlay` subcommand calls.
 //!
 //! See README.md for the wire contract.
@@ -22,10 +23,10 @@ pub mod controller;
 pub mod geom;
 pub mod protocol;
 pub mod render;
-mod run;
+pub(crate) mod run;
 mod sys;
 
-#[cfg(feature = "layer-shell")]
+#[cfg(any(feature = "layer-shell", feature = "x11"))]
 pub use run::run;
-pub use run::run_with;
+pub use run::{BACKEND_ENV, run_with};
 pub use sys::PARENT_PID_ENV;

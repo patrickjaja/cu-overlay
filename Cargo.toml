@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Click-through Computer Use glow and drawn cursor for the claude-desktop-extra bridges (layer-shell overlay)"
+description = "Click-through Computer Use glow and drawn cursor for the claude-desktop-extra bridges (layer-shell and XWayland overlays)"
 repository = "https://github.com/patrickjaja/cu-overlay"
 publish = false
 
@@ -18,6 +18,10 @@ layer-shell = [
     "dep:wayland-protocols",
     "dep:wayland-protocols-wlr",
 ]
+# XWayland backend for compositors without layer-shell (GNOME/Mutter):
+# override-redirect ARGB windows with an empty input shape. Opt-in: only the
+# GNOME bridge needs it.
+x11 = ["dep:x11rb"]
 
 [dependencies]
 # Pure Rust, no C dependencies: builds static for the musl targets.
@@ -32,11 +36,12 @@ tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "
 wayland-client = { version = "0.31.14", optional = true }
 wayland-protocols = { version = "0.32.12", optional = true, features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3.12", optional = true, features = ["client"] }
+# x11 backend. RustConnection is pure Rust (no libxcb).
+x11rb = { version = "0.13.2", optional = true, default-features = false, features = ["randr", "shape", "shm"] }
 
 [[bin]]
 name = "cu-overlay-demo"
 path = "src/bin/cu-overlay-demo.rs"
-required-features = ["layer-shell"]
 
 [profile.release]
 strip = true

@@ -862,6 +862,7 @@ impl Backend for LayerShell {
             alpha_modifier: self.st.g.alpha.is_some(),
             fractional_scale: self.st.g.fractional.is_some(),
             badge: true,
+            pulse_interval: Some(crate::run::PULSE_INTERVAL),
         }
     }
 

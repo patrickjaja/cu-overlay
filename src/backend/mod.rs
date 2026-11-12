@@ -1,14 +1,18 @@
-//! The seam between the run loop and a windowing system. Phase 1 ships the
-//! layer-shell backend (`layer-shell` feature); an X11 override-redirect
-//! backend for GNOME can implement the same trait later.
+//! The seam between the run loop and a windowing system: the layer-shell
+//! backend (`layer-shell` feature, Wayland compositors with
+//! wlr-layer-shell) and the X11 backend (`x11` feature, XWayland on
+//! compositors without it, i.e. GNOME/Mutter).
 
 use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 
 use crate::controller::Scene;
 use crate::geom::OutputInfo;
 
 #[cfg(feature = "layer-shell")]
 pub mod layer_shell;
+#[cfg(feature = "x11")]
+pub mod x11;
 
 /// What a backend can do; reported in `ready`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +25,9 @@ pub struct Caps {
     pub fractional_scale: bool,
     /// The backend draws the badge (`ready` reports it).
     pub badge: bool,
+    /// How often the pulsing glow is re-presented; `None`: the glow is
+    /// static (its base keyframe), as without an alpha modifier.
+    pub pulse_interval: Option<Duration>,
 }
 
 /// Something the backend observed while dispatching.
@@ -78,4 +85,10 @@ pub trait Backend {
     /// Request a round trip; [`BackendEvent::Synced`] with `token` comes
     /// back once the server processed everything sent before.
     fn sync(&mut self, token: u64);
+
+    /// A backend timer (frame pacing, a held-back sync): the loop wakes up
+    /// by then and calls [`Backend::dispatch`].
+    fn next_wakeup(&self) -> Option<Instant> {
+        None
+    }
 }
