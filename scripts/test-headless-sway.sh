@@ -455,7 +455,10 @@ wait_event '"event":"error","message":"arrow outside output HEADLESS-1","fatal":
 sleep 0.15
 shot g_off2 HEADLESS-2; shot g_off1 HEADLESS-1
 assert_shot "nothing drawn on HEADLESS-2 for an off-output jump + press" g_off2 1280 'all_bg()'
-assert_shot "HEADLESS-1 keeps its rim, no arrow or ring anywhere on it" g_off1 1280 'clay(px(0,400)) and clay(px(1279,400)) and region(4,4,1276,796,reddish) == 0'
+# The interior check starts 12 px in, like the badge checks: the rim's own
+# glow at its corners (6,6) is faint red over the gray empty output of sway
+# 1.9 and would count as "reddish" there (it is near-black over black).
+assert_shot "HEADLESS-1 keeps its rim, no arrow or ring anywhere on it" g_off1 1280 'clay(px(0,400)) and clay(px(1279,400)) and region(12,12,1268,788,reddish) == 0'
 kill -0 "$OPID" 2>/dev/null && ok "alive after off-output commands" || bad "died on off-output commands"
 # move to the output the pose is on: drawn there without resending it
 sleep 1.2
@@ -469,7 +472,11 @@ assert_shot "after move: nothing left on HEADLESS-1" g_moved1 1280 'all_bg()'
 send '{"cmd":"move","output":"HEADLESS-1"}'
 wait_event '"event":"shown","output":"HEADLESS-1"' || bad "shown g3"
 send '{"cmd":"press","x":1276,"y":400}'
-sleep 0.05
+# The ring starts at a quarter of its size (radius 8.5: its left edge at
+# x 1267, outside the counted box), and a shot taken right after the press
+# can miss the arrow's snap as well (seen on a fast host). At 300 ms the
+# ring is near full size and still mostly opaque (it lasts 1100 ms).
+sleep 0.3
 shot g_edge2 HEADLESS-2; shot g_edge1 HEADLESS-1
 assert_shot "straddling from HEADLESS-1: no pixel of ours on HEADLESS-2" g_edge2 1280 'all_bg()'
 assert_shot "straddling from HEADLESS-1: the arrow tip and the ring's left half on HEADLESS-1" g_edge1 1280 'region(1270,396,1280,412,clay) > 3 and region(1200,340,1266,460,lambda p: p[0] - p[2] > 8) > 10'
