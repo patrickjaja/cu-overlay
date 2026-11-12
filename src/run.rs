@@ -209,7 +209,7 @@ impl<B: Backend, W: Write> Loop<B, W> {
         if let Some(s) = &self.last_scene
             && self.be.ready_to_draw()
         {
-            if s.pulse.is_some() {
+            if s.pulse.is_some() || s.badge.is_some() {
                 at(self.last_present + PULSE_INTERVAL);
             }
             if s.animating {
@@ -255,7 +255,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         backend: caps.name,
         alpha_modifier: caps.alpha_modifier,
         fractional_scale: caps.fractional_scale,
-        badge: false,
+        badge: caps.badge,
         capture_scopes: crate::protocol::CAPTURE_SCOPES,
         outputs: l.be.outputs(),
     };
@@ -277,7 +277,7 @@ pub fn run_with<B: Backend, R: AsFd, W: Write>(backend: B, input: R, output: W) 
         // frame-paced animation, pulse and stall timers
         if let Some(s) = &l.last_scene {
             let since = now.saturating_duration_since(l.last_present);
-            if (s.pulse.is_some() && since >= PULSE_INTERVAL)
+            if ((s.pulse.is_some() || s.badge.is_some()) && since >= PULSE_INTERVAL)
                 || (s.animating && since >= STALL_INTERVAL)
             {
                 l.dirty = true;

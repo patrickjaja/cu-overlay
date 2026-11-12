@@ -4,6 +4,8 @@
 //!
 //! - [`render`]: the renderer core, no I/O (glow bands, rim, arrow, ring).
 //! - [`anim`]: upstream's motion as pure functions of time.
+//! - [`badge`]: the "Claude is using your computer" pill (layout, timing,
+//!   painting with one embedded font subset).
 //! - [`protocol`]: the JSON-lines wire protocol (stdin commands, stdout
 //!   events).
 //! - [`controller`]: the protocol state machine, backend-independent.
@@ -15,6 +17,7 @@
 
 pub mod anim;
 pub mod backend;
+pub mod badge;
 pub mod controller;
 pub mod geom;
 pub mod protocol;

@@ -73,9 +73,10 @@ pub enum CapturePhase {
 pub struct Show {
     pub output: String,
     pub look: Look,
-    /// Accepted and ignored in protocol 1 (no text rendering; `ready`
-    /// reports `"badge":false`).
+    /// Flash the badge (restarts it; `false` clears a running one).
     pub badge: bool,
+    /// Text of the badge, cleaned; `None` is the built-in English default.
+    pub badge_text: Option<String>,
     pub reduced_motion: bool,
     pub arrow: Option<(f64, f64)>,
 }
@@ -124,6 +125,8 @@ enum Raw {
         look: Look,
         #[serde(default)]
         badge: bool,
+        #[serde(default)]
+        badge_text: Option<String>,
         #[serde(default)]
         reduced_motion: bool,
         #[serde(default)]
@@ -178,6 +181,7 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
             output,
             look,
             badge,
+            badge_text,
             reduced_motion,
             arrow,
         } => {
@@ -189,6 +193,7 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
                 output,
                 look,
                 badge,
+                badge_text: badge_text.as_deref().and_then(crate::badge::clean_text),
                 reduced_motion,
                 arrow,
             })
@@ -294,6 +299,59 @@ impl Event {
 mod tests {
     use super::*;
 
+    fn show(line: &str) -> Show {
+        let Command::Show(s) = parse_command(line).unwrap() else {
+            panic!("not a show")
+        };
+        s
+    }
+
+    #[test]
+    fn badge_forms_old_and_new() {
+        // protocol-1 callers: badge true/false only, no text
+        let s = show(r#"{"cmd":"show","output":"A","badge":true}"#);
+        assert!(s.badge && s.badge_text.is_none());
+        let s = show(r#"{"cmd":"show","output":"A","badge":false}"#);
+        assert!(!s.badge && s.badge_text.is_none());
+        let s = show(r#"{"cmd":"show","output":"A"}"#);
+        assert!(!s.badge && s.badge_text.is_none());
+        // new: the text overrides the built-in default
+        let s = show(
+            r#"{"cmd":"show","output":"A","badge":true,"badgeText":"Claude nutzt deinen Computer"}"#,
+        );
+        assert!(s.badge);
+        assert_eq!(
+            s.badge_text.as_deref(),
+            Some("Claude nutzt deinen Computer")
+        );
+        // text without badge:true is carried but draws nothing (controller)
+        let s = show(r#"{"cmd":"show","output":"A","badge":false,"badgeText":"x"}"#);
+        assert!(!s.badge && s.badge_text.as_deref() == Some("x"));
+        // empty, blank and null fall back to the default
+        for t in ["\"\"", "\"  \\n \"", "null"] {
+            let s = show(&format!(
+                r#"{{"cmd":"show","output":"A","badge":true,"badgeText":{t}}}"#
+            ));
+            assert!(s.badge_text.is_none(), "{t}");
+        }
+        // control characters become spaces
+        let s = show(r#"{"cmd":"show","output":"A","badge":true,"badgeText":"a\nb"}"#);
+        assert_eq!(s.badge_text.as_deref(), Some("a b"));
+        // absurd lengths are cut
+        let long = "y".repeat(10_000);
+        let s = show(&format!(
+            r#"{{"cmd":"show","output":"A","badge":true,"badgeText":"{long}"}}"#
+        ));
+        assert_eq!(
+            s.badge_text.unwrap().chars().count(),
+            crate::badge::MAX_TEXT_CHARS
+        );
+        // a wrong type is a non-fatal bad command like any other field
+        assert!(
+            parse_command(r#"{"cmd":"show","output":"A","badge":true,"badgeText":5}"#).is_err()
+        );
+    }
+
     #[test]
     fn parses_show() {
         let c = parse_command(
@@ -306,6 +364,7 @@ mod tests {
                 output: "DP-1".into(),
                 look: Look::Rim,
                 badge: true,
+                badge_text: None,
                 reduced_motion: true,
                 arrow: Some((10.0, 20.5)),
             })

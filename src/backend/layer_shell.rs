@@ -1,9 +1,10 @@
 //! Wayland backend: a wlr-layer-shell surface on the overlay layer of one
 //! output, anchored to all edges, exclusive zone -1, no keyboard
 //! interactivity and an empty input region, so every click and key goes to
-//! the windows below. Two synchronized subsurfaces carry the press ring and
-//! the drawn arrow, so moving the arrow only redraws a small buffer and
-//! buffer + position land atomically with the parent commit.
+//! the windows below. Three synchronized subsurfaces carry the badge, the
+//! press ring and the drawn arrow (in that stacking order), so moving the
+//! arrow only redraws a small buffer and buffer + position land atomically
+//! with the parent commit.
 //!
 //! Optional globals: wp_viewporter + wp_fractional_scale_v1 (crisp at
 //! fractional scales), wp_alpha_modifier_v1 (fades, glow pulse and capture
@@ -30,6 +31,7 @@ use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zx
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 use super::{Backend, BackendEvent, Caps};
+use crate::badge;
 use crate::controller::Scene;
 use crate::geom::{self, OutputInfo};
 use crate::protocol::Look;
@@ -104,6 +106,7 @@ enum Role {
     Main,
     Ring,
     Cursor,
+    Badge,
 }
 
 struct Buf {
@@ -179,6 +182,7 @@ struct Surf {
     vp: Option<wp_viewport::WpViewport>,
     frac: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     alpha: Option<wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1>,
+    badge: Sub,
     ring: Sub,
     cur: Sub,
     configured: bool,
@@ -204,9 +208,9 @@ struct St {
     bufs: HashMap<u32, Buf>,
     next_buf: u32,
     events: Vec<BackendEvent>,
-    /// Redraws of the main, ring and arrow buffers, and main commits
+    /// Redraws of the main, ring, arrow and badge buffers, and main commits
     /// (printed to stderr at exit with `CU_OVERLAY_DEBUG=1`).
-    stats: [u64; 4],
+    stats: [u64; 5],
 }
 
 pub struct LayerShell {
@@ -309,6 +313,7 @@ impl St {
             if let Some(f) = s.frac {
                 f.destroy();
             }
+            s.badge.destroy();
             s.ring.destroy();
             s.cur.destroy();
             s.layer.destroy();
@@ -373,7 +378,7 @@ impl LayerShell {
             bufs: HashMap::new(),
             next_buf: 1,
             events: Vec::new(),
-            stats: [0; 4],
+            stats: [0; 5],
         };
         let registry = globals.registry().clone();
         globals.contents().with_list(|list| {
@@ -606,6 +611,126 @@ impl LayerShell {
         Ok(changed)
     }
 
+    /// Update the badge subsurface. The surface keeps the size of the pill's
+    /// largest scale for the whole flash (so buffers are reused); the pill is
+    /// drawn inside it at its current scale, at a sub-pixel offset, and the
+    /// box follows the pill in whole logical pixels, clamped to the output.
+    /// Not drawn (blanked in place, as the arrow is) while the flash is not
+    /// running, invisible, or the output is too small for the box.
+    fn present_badge(&mut self, scene: &Scene, s120: u32) -> Result<bool, String> {
+        let has_alpha = self.st.g.alpha.is_some();
+        let st = &mut self.st;
+        let Some(surf) = st.surf.as_mut() else {
+            return Ok(false);
+        };
+        let (ow, oh) = surf.size;
+        let placed = scene.badge.as_ref().and_then(|b| {
+            let layout = badge::Layout::new(&b.text);
+            let (bw, bh) = layout.box_size();
+            if bw > ow || bh > oh {
+                return None;
+            }
+            let pose = badge::pose(b.ms, (f64::from(ow), f64::from(oh)), layout.w, layout.h)?;
+            let opacity = pose.opacity * scene.opacity;
+            (opacity > 0.0).then_some((b, layout, pose, opacity, (bw, bh)))
+        });
+        let Some((b, layout, pose, opacity, (bw, bh))) = placed else {
+            // blank in place, never a null attach (see `present_sub`)
+            let sub = &surf.badge;
+            let (Some(key), Some((pw, ph))) = (sub.key, sub.dims) else {
+                return Ok(false);
+            };
+            if key == BLANK {
+                return Ok(false);
+            }
+            let id = st.take_buf(Role::Badge, pw, ph, &self.qh)?;
+            let buf = st.bufs.get_mut(&id).expect("buffer just taken");
+            render::clear(buf.pixels());
+            buf.busy = true;
+            let wl = buf.wl.clone();
+            let sub = &mut st.surf.as_mut().expect("surface checked above").badge;
+            sub.surf.attach(Some(&wl), 0, 0);
+            sub.surf.damage_buffer(0, 0, pw, ph);
+            sub.surf.commit();
+            sub.key = Some(BLANK);
+            return Ok(true);
+        };
+        let bx = ((pose.cx - f64::from(bw) / 2.0).round() as i32).clamp(0, ow - bw);
+        let by = ((pose.cy - f64::from(bh) / 2.0).round() as i32).clamp(0, oh - bh);
+        let scalef = s120 as f32 / 120.0;
+        let (px, py) = (
+            (pose.cx - f64::from(bx)) as f32 * scalef,
+            (pose.cy - f64::from(by)) as f32 * scalef,
+        );
+        let (dot_alpha, dot_scale) = badge::dot(b.ms);
+        let baked = if has_alpha { 1.0 } else { opacity };
+        let text_hash = b.text.bytes().fold(2_166_136_261u32, |h, c| {
+            (h ^ u32::from(c)).wrapping_mul(16_777_619)
+        }) as i32;
+        let key = SubKey([
+            (px * 16.0).round() as i32,
+            (py * 16.0).round() as i32,
+            (pose.scale * 1000.0).round() as i32,
+            ((dot_alpha * 255.0).round() as i32) << 8 | (dot_scale * 255.0).round() as i32,
+            text_hash,
+            (bw << 16) | bh,
+            0,
+            ((baked * 255.0).round() as i32) << 12 | s120 as i32,
+        ]);
+        let mut changed = false;
+        let sub = &mut st.surf.as_mut().expect("surface checked above").badge;
+        if sub.key != Some(key) {
+            let (pw, ph) = (geom::to_px(bw, s120).max(1), geom::to_px(bh, s120).max(1));
+            let id = st.take_buf(Role::Badge, pw, ph, &self.qh)?;
+            let buf = st.bufs.get_mut(&id).expect("buffer just taken");
+            badge::draw(
+                buf.pixels(),
+                pw as usize,
+                ph as usize,
+                &layout,
+                &badge::Paint2 {
+                    cx: px,
+                    cy: py,
+                    k: scalef * pose.scale as f32,
+                    dot_alpha: dot_alpha as f32,
+                    dot_scale: dot_scale as f32,
+                    opacity: baked as f32,
+                },
+            );
+            buf.busy = true;
+            let wl = buf.wl.clone();
+            let sub = &mut st.surf.as_mut().expect("surface checked above").badge;
+            sub.surf.attach(Some(&wl), 0, 0);
+            sub.surf.damage_buffer(0, 0, pw, ph);
+            match &sub.vp {
+                Some(vp) => vp.set_destination(bw, bh),
+                None => sub.surf.set_buffer_scale((s120 / 120) as i32),
+            }
+            sub.key = Some(key);
+            sub.dims = Some((pw, ph));
+            st.stats[4] += 1;
+            changed = true;
+        }
+        let sub = &mut st.surf.as_mut().expect("surface checked above").badge;
+        if let Some(a) = &sub.alpha {
+            let m = mult(opacity);
+            if sub.mult != Some(m) {
+                a.set_multiplier(m);
+                sub.mult = Some(m);
+                changed = true;
+            }
+        }
+        if changed {
+            sub.surf.commit();
+        }
+        if sub.pos != Some((bx, by)) {
+            sub.sub.set_position(bx, by);
+            sub.pos = Some((bx, by));
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     fn present_inner(&mut self, scene: &Scene) -> Result<(), String> {
         let Some(s) = &self.st.surf else {
             return Ok(());
@@ -618,6 +743,7 @@ impl LayerShell {
         };
         let s120 = self.scale120();
         let mut changed = self.present_main(scene, s120)?;
+        changed |= self.present_badge(scene, s120)?;
 
         let ring = scene.press.map(|p| {
             let f = p.frame;
@@ -723,8 +849,8 @@ fn bind_output(
 impl Drop for LayerShell {
     fn drop(&mut self) {
         if std::env::var_os("CU_OVERLAY_DEBUG").is_some_and(|v| v != "0") {
-            let [m, r, c, k] = self.st.stats;
-            eprintln!("cu-overlay: redraws main={m} ring={r} arrow={c}, commits={k}");
+            let [m, r, c, k, b] = self.st.stats;
+            eprintln!("cu-overlay: redraws main={m} ring={r} arrow={c} badge={b}, commits={k}");
         }
     }
 }
@@ -735,6 +861,7 @@ impl Backend for LayerShell {
             name: "layer-shell",
             alpha_modifier: self.st.g.alpha.is_some(),
             fractional_scale: self.st.g.fractional.is_some(),
+            badge: true,
         }
     }
 
@@ -803,7 +930,9 @@ impl Backend for LayerShell {
         };
         let main = g.compositor.create_surface(qh, ());
         main.set_input_region(Some(&empty));
-        // created in stacking order: ring below the arrow, both above main
+        // created in stacking order: the badge below the ring, the ring
+        // below the arrow (as in upstream's page), all above main
+        let badge = mk_sub(&main);
         let ring = mk_sub(&main);
         let cur = mk_sub(&main);
         empty.destroy();
@@ -835,6 +964,7 @@ impl Backend for LayerShell {
             vp,
             frac,
             alpha,
+            badge,
             ring,
             cur,
             configured: false,

@@ -1,7 +1,8 @@
 //! Render the renderer core's pieces to raw BGRA files for inspection:
 //! `cargo run --example snapshot -- <dir> [scale]` writes `arrow.bgra`
 //! (CURSOR_SIZE square), `ring.bgra` (RING_SIZE square, mid-press) and
-//! `glow.bgra` (640x400), each with a `.txt` holding `width height`.
+//! `glow.bgra` (640x400) and `badge.bgra` (the badge at the centre scale),
+//! each with a `.txt` holding `width height`.
 
 use cu_overlay::anim::press_frame;
 use cu_overlay::geom::to_px;
@@ -55,4 +56,20 @@ fn main() {
     let mut b = vec![0u8; w * h * 4];
     render::draw_glow(&mut b, w, h, scale, &render::GLOW_PEAK);
     save(&dir, "glow", &b, w, h);
+
+    let layout = cu_overlay::badge::Layout::new(cu_overlay::badge::DEFAULT_TEXT);
+    let (bw, bh) = layout.box_size();
+    let (w, h) = (to_px(bw, s120) as usize, to_px(bh, s120) as usize);
+    let mut b = vec![0u8; w * h * 4];
+    let (da, ds) = cu_overlay::badge::dot(0.0);
+    let p = cu_overlay::badge::Paint2 {
+        cx: w as f32 / 2.0,
+        cy: h as f32 / 2.0,
+        k: scale * cu_overlay::badge::SCALE_CENTER as f32,
+        dot_alpha: da as f32,
+        dot_scale: ds as f32,
+        opacity: 1.0,
+    };
+    cu_overlay::badge::draw(&mut b, w, h, &layout, &p);
+    save(&dir, "badge", &b, w, h);
 }

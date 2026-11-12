@@ -157,8 +157,8 @@ assert_shot "baseline: HEADLESS-2 is uniform and the same colour" bg_2 1280 'all
 echo ">>> overlay A (all optional globals)"
 start_overlay a
 wait_event '"event":"ready"' && ok "ready: $LAST" || bad "no ready"
-[[ "$LAST" == *'"fractionalScale":true'* && "$LAST" == *'"badge":false'* && "$LAST" == *'"captureScopes":["all","cursor"]'* ]] \
-  && ok "ready reports fractionalScale, badge:false, captureScopes" || bad "ready caps"
+[[ "$LAST" == *'"fractionalScale":true'* && "$LAST" == *'"badge":true'* && "$LAST" == *'"captureScopes":["all","cursor"]'* ]] \
+  && ok "ready reports fractionalScale, badge:true, captureScopes" || bad "ready caps"
 # alpha-modifier is optional (wlroots >= 0.18): the pulse is checked only with it
 ALPHA=0
 [[ "$LAST" == *'"alphaModifier":true'* ]] && ALPHA=1
@@ -166,8 +166,8 @@ echo ">>> alphaModifier: $ALPHA"
 [[ "$LAST" == *'{"name":"HEADLESS-2","x":1280,"y":0,"width":1280,"height":800,"scale":1.5}'* ]] \
   && ok "ready lists HEADLESS-2 at 1280,0 1280x800 scale 1.5" || bad "ready outputs"
 
-# rim + arrow on HEADLESS-1
-send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true,"arrow":{"x":300,"y":200}}'
+# rim + arrow on HEADLESS-1 (no badge here: its flash is tested in overlay H)
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":false,"arrow":{"x":300,"y":200}}'
 wait_event '"event":"shown","output":"HEADLESS-1","scale":1\.0' && ok "shown on HEADLESS-1" || bad "shown"
 sleep 0.5
 shot rim HEADLESS-1
@@ -346,6 +346,11 @@ if [ "$CPU" = 1 ]; then
   measure "glow, pulsing (alpha modifier)" idle
   send '{"cmd":"move","output":"HEADLESS-2"}'; send '{"cmd":"look","look":"rim"}'; sleep 1
   measure "rim, glide + press every second" driver
+  # the badge: 6 s of flash (dot pulse at 30 Hz, frame-paced flash-in and slide), then idle
+  send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true}'
+  b0=$(ticks); sleep 6.2; b1=$(ticks)
+  python3 -I -c "print('    %-34s %5.2f %% of one core' % ('badge flash (6.2 s window)', 100.0 * ($b1 - $b0) / $hz / 6.2))"
+  measure "rim, idle after the badge" idle
 fi
 
 # EOF ends the overlay with 0
@@ -376,6 +381,16 @@ send '{"cmd":"capture","phase":"restore","id":2}'
 wait_event '"event":"ack","id":2' || bad "ack b2"
 shot b_restored HEADLESS-1
 assert_shot "restored without alpha modifier" b_restored 1280 'clay(px(0,400)) and clay(px(512,312))'
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true}'
+sleep 1.0
+shot b_badge HEADLESS-1
+assert_shot "badge without alpha modifier (opacity baked into the pixels)" b_badge 1280 'region(480,380,800,420,white) > 3000 and region(500,385,790,415,clay) > 150'
+send '{"cmd":"capture","phase":"hide","id":3}'
+wait_event '"event":"ack","id":3' || bad "ack b3"
+shot b_badge_cap HEADLESS-1
+assert_shot "capture hide takes the badge too (no alpha modifier)" b_badge_cap 1280 'all_bg()'
+send '{"cmd":"capture","phase":"restore","id":4}'
+wait_event '"event":"ack","id":4' || bad "ack b4"
 send '{"cmd":"hide"}'
 wait_event '"event":"hidden"' 1 && ok "instant hide" || bad "hide b"
 shot b_hidden HEADLESS-1
@@ -514,6 +529,78 @@ p.stdin.close(); p.wait(timeout=5)
 sys.exit(0 if ok and p.returncode == 0 else 1)
 PY
 then ok "capture acks within 100 ms (all rounds)"; else bad "capture latency"; fi
+
+echo ">>> overlay H (badge: flash in at the centre, slide to the corner, gone; reduced motion, text, capture scopes)"
+SEEN=0
+start_overlay h
+wait_event '"event":"ready"' || bad "ready h"
+# the pill, 1.4x its CSS size (about 336 x 50 logical), centred on a 1280x800 output
+PILL_IN='region(480,380,800,420,white) > 3000 and region(500,385,790,415,clay) > 150 and bg(px(400,400)) and bg(px(640,330)) and bg(px(640,470))'
+T0=$(date +%s.%N)
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true}'
+wait_event '"event":"shown","output":"HEADLESS-1"' || bad "shown h"
+sleep 1.0
+shot badge_hold HEADLESS-1
+assert_shot "badge flashed in: warm near-white pill with clay text at the centre, nothing around it" badge_hold 1280 "$PILL_IN"
+assert_shot "the rim is still drawn with the badge" badge_hold 1280 'clay(px(0.3,400)) and clay(px(640,0.3))'
+# the badge is not the cursor: scope=cursor leaves it, scope=all takes it with the rest
+# (a fresh flash first: the screenshots above take a while, and a check must
+# not straddle the 5.3 s slide)
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true}'
+sleep 0.7
+send '{"cmd":"capture","phase":"hide","id":40,"scope":"cursor"}'
+wait_event '"event":"ack","id":40' || bad "ack 40"
+shot badge_cap_cursor HEADLESS-1
+assert_shot "scope=cursor: the badge stays" badge_cap_cursor 1280 "$PILL_IN"
+send '{"cmd":"capture","phase":"hide","id":41,"scope":"all"}'
+wait_event '"event":"ack","id":41' || bad "ack 41"
+shot badge_cap_all HEADLESS-1
+assert_shot "scope=all: badge and rim fully transparent" badge_cap_all 1280 'all_bg()'
+send '{"cmd":"capture","phase":"restore","id":42}'
+wait_event '"event":"ack","id":42' || bad "ack 42"
+shot badge_cap_back HEADLESS-1
+assert_shot "after restore the badge is back where the flash is" badge_cap_back 1280 "$PILL_IN"
+# slide: restart the flash, wait until 5.6 s after the show, the pill is on its
+# way to the top-right
+T0=$(date +%s.%N)
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true}'
+while [ "$(python3 -I -c "import time; print(int(time.time() - $T0 < 5.6))")" = 1 ]; do sleep 0.05; done
+shot badge_slide HEADLESS-1
+assert_shot "slide: the pill left the centre and is in the upper right" badge_slide 1280 'region(480,380,800,420,white) < 500 and region(640,20,1280,300,lambda p: not bg(p)) > 400'
+sleep 1.0
+shot badge_gone HEADLESS-1
+assert_shot "after 6 s the badge is gone (interior empty, rim only)" badge_gone 1280 'region(12,12,1268,788,lambda p: not bg(p)) == 0 and clay(px(0.3,400))'
+# idle again: a static rim commits nothing
+# reduced motion never shows it
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true,"reducedMotion":true}'
+sleep 0.8
+shot badge_reduced HEADLESS-1
+assert_shot "reducedMotion: no badge" badge_reduced 1280 'region(12,12,1268,788,lambda p: not bg(p)) == 0'
+# badgeText overrides the text; a short one is a narrow pill (about 92 px wide)
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":true,"badgeText":"Hi"}'
+sleep 0.9
+shot badge_text HEADLESS-1
+assert_shot "badgeText: a narrow pill replaces the default" badge_text 1280 'region(596,380,684,420,white) > 800 and region(440,380,580,420,lambda p: not bg(p)) == 0 and region(700,380,840,420,lambda p: not bg(p)) == 0'
+# a show without badge clears a running flash
+send '{"cmd":"show","output":"HEADLESS-1","look":"rim","badge":false}'
+sleep 0.5
+shot badge_cleared HEADLESS-1
+assert_shot "show with badge:false clears the flash" badge_cleared 1280 'region(12,12,1268,788,lambda p: not bg(p)) == 0'
+# fractional scale: centred on the 1.5 output, confined to it, crisp text
+send '{"cmd":"show","output":"HEADLESS-2","look":"rim","badge":true}'
+wait_event '"event":"shown","output":"HEADLESS-2","scale":1\.5' || bad "shown h2"
+sleep 1.0
+shot badge_out2 HEADLESS-2; shot badge_out1 HEADLESS-1
+assert_shot "HEADLESS-2 (scale 1.5): the pill is centred" badge_out2 1280 "$PILL_IN"
+assert_shot "nothing of the badge on HEADLESS-1" badge_out1 1280 'all_bg()'
+# the pill is not an input target: the surface has an empty input region
+# (shared with the arrow and ring, whose click-through is tested above)
+send '{"cmd":"hide"}'
+wait_event '"event":"hidden"' && ok "hidden with a badge flashing" || bad "hidden h"
+shot badge_hidden HEADLESS-2
+assert_shot "nothing left after hide" badge_hidden 1280 'all_bg()'
+exec 3>&-
+wait "$OPID" || bad "overlay h exit $?"
 
 echo ">>> overlay C (unknown output is fatal)"
 SEEN=0

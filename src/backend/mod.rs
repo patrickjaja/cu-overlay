@@ -19,6 +19,8 @@ pub struct Caps {
     pub alpha_modifier: bool,
     /// The surface scale follows the compositor's fractional scale.
     pub fractional_scale: bool,
+    /// The backend draws the badge (`ready` reports it).
+    pub badge: bool,
 }
 
 /// Something the backend observed while dispatching.

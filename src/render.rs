@@ -50,7 +50,7 @@ pub const CURSOR_HOT: i32 = 64;
 pub const RING_SIZE: i32 = 112;
 pub const RING_HALF: i32 = RING_SIZE / 2;
 
-fn bgra(r: u8, g: u8, b: u8, a: f32) -> Color {
+pub(crate) fn bgra(r: u8, g: u8, b: u8, a: f32) -> Color {
     // tiny-skia writes R,G,B,A; the buffer is B,G,R,A: swap red and blue.
     Color::from_rgba8(b, g, r, (a.clamp(0.0, 1.0) * 255.0).round() as u8)
 }

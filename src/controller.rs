@@ -2,9 +2,11 @@
 //! screen at a given instant. Time is passed in, so every rule here is unit
 //! tested without a compositor.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::anim::{self, Glide, PressFrame};
+use crate::badge;
 use crate::geom::OutputInfo;
 use crate::protocol::{CapturePhase, CaptureScope, Command, Event, Look, Pose};
 
@@ -65,6 +67,14 @@ pub struct PressDraw {
     pub frame: PressFrame,
 }
 
+/// The badge for one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BadgeDraw {
+    /// Milliseconds since the flash started (see [`badge::pose`]).
+    pub ms: f64,
+    pub text: Arc<str>,
+}
+
 /// Everything a backend needs to draw one frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
@@ -76,6 +86,9 @@ pub struct Scene {
     pub pulse: Option<f64>,
     pub arrow: Option<ArrowDraw>,
     pub press: Option<PressDraw>,
+    /// The badge flash while it runs. It is not a cursor: a `cursor` capture
+    /// hide leaves it, an `all` hide takes it with the rest (`opacity`).
+    pub badge: Option<BadgeDraw>,
     /// A frame-paced animation is running (glide, press, fade).
     pub animating: bool,
 }
@@ -96,6 +109,8 @@ pub struct Controller {
     /// A capture hide in force: its scope and auto-restore deadline.
     capture: Option<(CaptureScope, Instant)>,
     pulse_epoch: Instant,
+    /// The running badge flash: its text and start.
+    badge: Option<(Arc<str>, Instant)>,
 }
 
 fn ms_since(now: Instant, t: Instant) -> f64 {
@@ -115,6 +130,7 @@ impl Controller {
             press: None,
             capture: None,
             pulse_epoch: now,
+            badge: None,
         }
     }
 
@@ -190,6 +206,12 @@ impl Controller {
                 }
                 self.look = s.look;
                 self.reduced_motion = s.reduced_motion;
+                // like upstream's page: every show restarts the flash or, with
+                // `badge:false`, clears it; reduced motion never shows it
+                self.badge = (s.badge && !s.reduced_motion).then(|| {
+                    let text = s.badge_text.as_deref().unwrap_or(badge::DEFAULT_TEXT);
+                    (Arc::from(text), now)
+                });
                 self.glide = None;
                 self.rest = s.arrow.map(|(x, y)| Pose::at(x, y));
                 let start = if self.fades { 0.0 } else { 1.0 };
@@ -279,6 +301,7 @@ impl Controller {
                 Vis::Shown { .. } => {
                     self.vis = Vis::Hidden;
                     self.press = None;
+                    self.badge = None;
                     vec![Action::Destroy]
                 }
             },
@@ -309,7 +332,14 @@ impl Controller {
         {
             self.vis = Vis::Hidden;
             self.press = None;
+            self.badge = None;
             out.push(Action::Destroy);
+        }
+        if let Some((_, start)) = &self.badge
+            && ms_since(now, *start) >= badge::FLASH_MS
+        {
+            self.badge = None;
+            out.push(Action::Redraw);
         }
         if let Some((g, start)) = &self.glide
             && ms_since(now, *start) >= g.duration_ms()
@@ -360,6 +390,9 @@ impl Controller {
         if let Some((_, t)) = self.capture {
             min(t);
         }
+        if let Some((_, start)) = &self.badge {
+            min(*start + Duration::from_secs_f64(badge::FLASH_MS / 1000.0));
+        }
         d
     }
 
@@ -369,6 +402,7 @@ impl Controller {
         self.vis = Vis::Hidden;
         self.press = None;
         self.glide = None;
+        self.badge = None;
     }
 
     /// The scope of the capture hide in force, if any.
@@ -414,6 +448,14 @@ impl Controller {
             }),
             _ => None,
         };
+        let badge = self.badge.as_ref().and_then(|(text, start)| {
+            let ms = ms_since(now, *start);
+            (ms < badge::FLASH_MS).then(|| BadgeDraw {
+                ms,
+                text: text.clone(),
+            })
+        });
+        let badge_moving = badge.as_ref().is_some_and(|b| badge::moving(b.ms));
         let pulse = (self.look == Look::Glow && !self.reduced_motion && self.fades)
             .then(|| anim::pulse(ms_since(now, self.pulse_epoch)));
         Some(Scene {
@@ -427,7 +469,10 @@ impl Controller {
             } else {
                 None
             },
-            animating: fading || (!cursor_off && (self.glide.is_some() || press.is_some())),
+            badge,
+            animating: fading
+                || badge_moving
+                || (!cursor_off && (self.glide.is_some() || press.is_some())),
         })
     }
 }
@@ -636,6 +681,7 @@ mod tests {
                 output: "A".into(),
                 look: Look::Rim,
                 badge: false,
+                badge_text: None,
                 reduced_motion: false,
                 arrow: None,
             }),
@@ -962,5 +1008,198 @@ mod tests {
         assert_eq!(a, vec![Action::Redraw], "no new surface");
         assert!(c.tick(ms(t0, 1400)).is_empty(), "no destroy");
         assert_eq!(c.scene(ms(t0, 1500)).unwrap().opacity, 1.0);
+    }
+
+    fn badge_ms(c: &Controller, now: Instant) -> Option<f64> {
+        c.scene(now).unwrap().badge.map(|b| b.ms)
+    }
+
+    #[test]
+    fn badge_flashes_for_six_seconds_then_stops_needing_ticks() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        // protocol-1 form: badge true only, built-in text
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        let b = c.scene(ms(t0, 1000)).unwrap().badge.unwrap();
+        assert_eq!(b.ms, 1000.0);
+        assert_eq!(&*b.text, crate::badge::DEFAULT_TEXT);
+        // the end of the flash is a deadline and a final redraw (blanking)
+        assert_eq!(c.next_deadline(), Some(ms(t0, 6000)));
+        assert!(c.tick(ms(t0, 5999)).is_empty());
+        assert!(badge_ms(&c, ms(t0, 5999)).is_some());
+        assert_eq!(c.tick(ms(t0, 6000)), vec![Action::Redraw]);
+        assert_eq!(badge_ms(&c, ms(t0, 6000)), None);
+        assert_eq!(c.next_deadline(), None);
+        // a static scene afterwards: nothing animates, no pulse timer
+        let s = c.scene(ms(t0, 7000)).unwrap();
+        assert!(!s.animating && s.badge.is_none());
+    }
+
+    #[test]
+    fn badge_text_override_restart_and_clear() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","badge":true,"badgeText":"Claude nutzt deinen Computer"}"#),
+            t0,
+            &outs(),
+        );
+        let b = c.scene(ms(t0, 10)).unwrap().badge.unwrap();
+        assert_eq!(&*b.text, "Claude nutzt deinen Computer");
+        // every show with a badge restarts the flash
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","badge":true}"#),
+            ms(t0, 2000),
+            &outs(),
+        );
+        assert_eq!(badge_ms(&c, ms(t0, 2500)), Some(500.0));
+        // a show without it clears a running flash (as upstream's page does)
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","badge":false}"#),
+            ms(t0, 3000),
+            &outs(),
+        );
+        assert_eq!(badge_ms(&c, ms(t0, 3001)), None);
+        assert_eq!(c.next_deadline(), None);
+        // text without badge:true draws nothing
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badgeText":"x"}"#),
+            ms(t0, 3100),
+            &outs(),
+        );
+        assert_eq!(badge_ms(&c, ms(t0, 3200)), None);
+    }
+
+    #[test]
+    fn badge_is_hidden_under_reduced_motion() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true,"reducedMotion":true}"#),
+            t0,
+            &outs(),
+        );
+        assert_eq!(badge_ms(&c, ms(t0, 500)), None);
+        assert_eq!(c.next_deadline(), None);
+        // switching reduced motion on while a flash runs cancels it
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            ms(t0, 600),
+            &outs(),
+        );
+        assert!(badge_ms(&c, ms(t0, 700)).is_some());
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true,"reducedMotion":true}"#),
+            ms(t0, 800),
+            &outs(),
+        );
+        assert_eq!(badge_ms(&c, ms(t0, 900)), None);
+    }
+
+    #[test]
+    fn badge_needs_frames_only_while_it_moves() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        // flash-in (and the layer's own fade): frame-paced
+        assert!(c.scene(ms(t0, 100)).unwrap().animating);
+        // the hold: the dot's timer only
+        let hold = c.scene(ms(t0, 2000)).unwrap();
+        assert!(!hold.animating && hold.badge.is_some());
+        // the slide to the corner: frame-paced again
+        assert!(c.scene(ms(t0, 5500)).unwrap().animating);
+    }
+
+    #[test]
+    fn badge_follows_capture_scopes_not_cursor() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","look":"rim","badge":true,"arrow":{"x":5,"y":5}}"#),
+            t0,
+            &outs(),
+        );
+        // scope cursor: arrow gone, badge and opacity untouched
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":1,"scope":"cursor"}"#),
+            ms(t0, 1000),
+            &outs(),
+        );
+        let s = c.scene(ms(t0, 1100)).unwrap();
+        assert!(s.arrow.is_none() && s.badge.is_some() && s.opacity == 1.0);
+        // scope all: the scene's opacity is 0, which the backend applies to
+        // the badge (it blanks the subsurface); the flash clock keeps running
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"hide","id":2,"scope":"all"}"#),
+            ms(t0, 1200),
+            &outs(),
+        );
+        let s = c.scene(ms(t0, 1300)).unwrap();
+        assert_eq!(s.opacity, 0.0);
+        assert_eq!(s.badge.unwrap().ms, 1300.0);
+        c.handle(
+            cmd(r#"{"cmd":"capture","phase":"restore","id":3}"#),
+            ms(t0, 1400),
+            &outs(),
+        );
+        let s = c.scene(ms(t0, 1500)).unwrap();
+        assert!(s.opacity > 0.99 && s.badge.is_some());
+    }
+
+    #[test]
+    fn badge_goes_with_the_surfaces() {
+        let t0 = Instant::now();
+        // instant hide (no alpha modifier)
+        let mut c = Controller::new(false, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(cmd(r#"{"cmd":"hide"}"#), ms(t0, 100), &outs());
+        assert!(c.scene(ms(t0, 100)).is_none());
+        c.handle(cmd(r#"{"cmd":"show","output":"A"}"#), ms(t0, 200), &outs());
+        assert_eq!(badge_ms(&c, ms(t0, 300)), None);
+        // fading hide: the badge fades with the layer, then is dropped
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(cmd(r#"{"cmd":"hide"}"#), ms(t0, 1000), &outs());
+        assert!(badge_ms(&c, ms(t0, 1100)).is_some());
+        assert!(c.tick(ms(t0, 1300)).contains(&Action::Destroy));
+        // lost surfaces
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        c.surfaces_lost();
+        c.handle(cmd(r#"{"cmd":"show","output":"A"}"#), ms(t0, 100), &outs());
+        assert_eq!(badge_ms(&c, ms(t0, 200)), None);
+    }
+
+    #[test]
+    fn badge_continues_across_a_move() {
+        let t0 = Instant::now();
+        let mut c = Controller::new(true, t0);
+        c.handle(
+            cmd(r#"{"cmd":"show","output":"A","badge":true}"#),
+            t0,
+            &outs(),
+        );
+        c.handle(cmd(r#"{"cmd":"move","output":"B"}"#), ms(t0, 2000), &outs());
+        assert_eq!(badge_ms(&c, ms(t0, 2500)), Some(2500.0));
     }
 }

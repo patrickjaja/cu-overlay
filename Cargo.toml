@@ -24,6 +24,8 @@ layer-shell = [
 libc = { version = "0.2.186", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+# Glyph outlines for the badge text (one embedded font subset, assets/).
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 # layer-shell backend. wayland-client's default backend is the pure-Rust one
 # (no libwayland).
